@@ -100,3 +100,59 @@ class Pipeline:
             "zone_events": self.events,
             "elapsed_s": elapsed,
         }
+
+    def stream(self, on_frame, on_event=None, loop=True, target_fps=None, stop_flag=None):
+        """
+        Callback-driven variant of run(), for serving a live feed instead of
+        writing one file. Calls on_frame(annotated_bgr_frame) every frame and
+        on_event(zone_event, class_name) whenever a zone crossing fires.
+
+        loop=True replays a recorded file source indefinitely so a video file
+        behaves like a continuous live camera for demo purposes — RTSP
+        sources already behave this way via VideoSource's own reconnect
+        logic, so looping is skipped for them.
+
+        stop_flag: optional callable; stream exits when it returns True
+        (used to cleanly shut down the background thread this normally runs
+        in).
+        """
+        frame_interval = 1.0 / target_fps if target_fps else None
+
+        while True:
+            for idx, frame in self.source.frames():
+                if stop_flag and stop_flag():
+                    return
+                t_start = time.time()
+
+                detections = self.detector.detect(frame)
+                tracked = self.tracker.update(detections, idx)
+
+                labels = []
+                for i in range(len(tracked)):
+                    cls_id = int(tracked.class_id[i])
+                    tid = int(tracked.tracker_id[i])
+                    conf = float(tracked.confidence[i])
+                    class_name = self.detector.class_name(cls_id)
+                    labels.append(f"#{tid} {class_name} {conf:.2f}")
+
+                    x1, y1, x2, y2 = tracked.xyxy[i]
+                    cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+                    for evt in self.zone_manager.update(tid, cx, cy, idx):
+                        self.events.append(evt)
+                        if on_event:
+                            on_event(evt, class_name)
+
+                annotated = frame.copy()
+                annotated = self.box_annotator.annotate(annotated, tracked)
+                annotated = self.label_annotator.annotate(annotated, tracked, labels=labels)
+                annotated = self._draw_zones(annotated)
+                on_frame(annotated)
+
+                if frame_interval:
+                    elapsed = time.time() - t_start
+                    if elapsed < frame_interval:
+                        time.sleep(frame_interval - elapsed)
+
+            if not loop or self.source.is_stream:
+                break
+            self.source._open()  # reopen the file to replay it

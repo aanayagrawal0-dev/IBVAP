@@ -1,0 +1,65 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@import url("https://fonts.googleapis.com/css2?family=Hanken+Grotesk:wght@400;500;600;700&display=swap");
+
+:root {
+  color-scheme: dark;
+}
+
+* {
+  border-color: theme("colors.obsidian.border");
+}
+
+html,
+body {
+  background-color: #08090b;
+  color: #fafafa;
+}
+
+body {
+  font-family: var(--font-hanken), "Hanken Grotesk", system-ui, sans-serif;
+}
+
+/* Static dot-grid backdrop, matching the reference design.
+   Deliberately NOT mouse-reactive — an operational security console
+   shouldn't have distracting cursor-follow effects. */
+.dot-grid-bg {
+  background-image: radial-gradient(rgba(255, 255, 255, 0.06) 1px, transparent 1px);
+  background-size: 22px 22px;
+}
+
+/* Respect reduced-motion preference across all custom animations */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Visible keyboard focus ring everywhere, on top of any custom styling */
+:focus-visible {
+  outline: 2px solid #ff5c00;
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: #0a0a0c;
+}
+::-webkit-scrollbar-thumb {
+  background: #232326;
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #2e2e32;
+}

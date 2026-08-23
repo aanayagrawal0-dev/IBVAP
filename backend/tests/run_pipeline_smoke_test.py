@@ -14,9 +14,14 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from src.pipeline import Pipeline
 from src.zones import Zone, ZoneManager
 
-SAMPLE_DIR = os.path.join(os.path.dirname(__file__), "..", "sample_data")
+BASE_DIR = os.path.join(os.path.dirname(__file__), "..")
+SAMPLE_DIR = os.path.join(BASE_DIR, "sample_data")
 INPUT_VIDEO = os.path.join(SAMPLE_DIR, "synthetic_test_clip.mp4")
 OUTPUT_VIDEO = os.path.join(SAMPLE_DIR, "annotated_output.mp4")
+# Use the weights packaged in models/ so this runs offline once cloned —
+# if you deleted that file, passing "yolov8n.pt" instead lets ultralytics
+# auto-download it (needs internet, ~6MB).
+WEIGHTS_PATH = os.path.join(BASE_DIR, "models", "yolov8n.pt")
 
 # A "virtual fence" zone covering the right half of the frame — the
 # panning motion in the synthetic clip guarantees objects cross into it,
@@ -32,7 +37,7 @@ zone_manager = ZoneManager(zones=[fence_zone])
 pipeline = Pipeline(
     source_uri=INPUT_VIDEO,
     zone_manager=zone_manager,
-    weights="yolov8n.pt",
+    weights=WEIGHTS_PATH,
     conf_threshold=0.30,
     source_name="synthetic-test",
 )

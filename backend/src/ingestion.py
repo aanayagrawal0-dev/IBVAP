@@ -4,8 +4,12 @@ Video ingestion layer.
 Wraps OpenCV's VideoCapture to give a uniform interface over:
   - local video files (for dev/testing and recorded-footage demos)
   - RTSP streams (real IP cameras in the field)
+  - a local webcam, passed as an integer device index (e.g. 0) — useful for
+    a live demo when no RTSP camera is available
 
-Handles reconnects on RTSP streams, since border-area links drop.
+Handles reconnects on RTSP streams and webcams, since border-area links
+drop and USB/webcam devices can also glitch; a local video file is treated
+as finite and simply ends at EOF instead.
 """
 
 import time
@@ -20,7 +24,12 @@ class VideoSource:
         self.name = name
         self.reconnect_delay_s = reconnect_delay_s
         self.max_reconnect_attempts = max_reconnect_attempts
-        self.is_stream = isinstance(uri, str) and uri.lower().startswith("rtsp://")
+        # Anything that isn't a path to a finite local file is treated as a
+        # "live" source that should reconnect on failure rather than just
+        # stopping: RTSP URLs and webcam device indices both qualify.
+        self.is_stream = isinstance(uri, int) or (
+            isinstance(uri, str) and uri.lower().startswith("rtsp://")
+        )
         self.cap = None
         self._open()
 

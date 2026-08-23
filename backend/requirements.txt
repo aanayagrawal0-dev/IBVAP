@@ -2,3 +2,5 @@ ultralytics>=8.2.0
 opencv-python>=4.9.0
 supervision>=0.21.0
 numpy>=1.26.0
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
