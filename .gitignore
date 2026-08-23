@@ -1,0 +1,7 @@
+venv/
+__pycache__/
+*.pyc
+*.pt
+sample_data/annotated_output.mp4
+sample_data/synthetic_test_clip.mp4
+.DS_Store

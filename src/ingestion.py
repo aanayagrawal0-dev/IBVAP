@@ -25,16 +25,18 @@ class VideoSource:
         self._open()
 
     def _open(self):
-        self.cap = cv2.VideoCapture(self.uri)
+        uri = int(self.uri) if isinstance(self.uri, str) and self.uri.isdigit() else self.uri
+        self.cap = cv2.VideoCapture(uri)
         if not self.cap.isOpened():
             raise ConnectionError(f"[{self.name}] could not open source: {self.uri}")
 
     def _reconnect(self):
+        uri = int(self.uri) if isinstance(self.uri, str) and self.uri.isdigit() else self.uri
         for attempt in range(1, self.max_reconnect_attempts + 1):
             print(f"[{self.name}] reconnect attempt {attempt}/{self.max_reconnect_attempts}...")
             time.sleep(self.reconnect_delay_s)
             self.cap.release()
-            self.cap = cv2.VideoCapture(self.uri)
+            self.cap = cv2.VideoCapture(uri)
             if self.cap.isOpened():
                 print(f"[{self.name}] reconnected.")
                 return True

@@ -40,7 +40,7 @@ class Pipeline:
                         0.5, (0, 0, 255), 2)
         return frame
 
-    def run(self, output_path=None, max_frames=None, print_every=25):
+    def run(self, output_path=None, max_frames=None, print_every=25, show_window=False):
         writer = None
         frame_count = 0
         detection_count = 0
@@ -80,12 +80,20 @@ class Pipeline:
                     writer = cv2.VideoWriter(output_path, fourcc, self.source.fps, (w, h))
                 writer.write(annotated)
 
+            if show_window:
+                cv2.imshow("IBVAP Live Feed (Press 'q' to Quit)", annotated)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    print("\nUser quit live window preview.")
+                    break
+
             frame_count += 1
             if frame_count % print_every == 0:
                 elapsed = time.time() - t0
                 print(f"frame {frame_count} | {frame_count/elapsed:.1f} fps | "
                       f"{len(tracked)} tracked objects this frame")
 
+        if show_window:
+            cv2.destroyAllWindows()
         if writer is not None:
             writer.release()
         self.source.release()

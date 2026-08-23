@@ -1,0 +1,520 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IBVAP — Intelligent Border & Perimeter Surveillance AI</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-dark: #0b0f19;
+            --card-bg: rgba(23, 31, 51, 0.65);
+            --border-color: rgba(255, 255, 255, 0.08);
+            --accent-blue: #3b82f6;
+            --accent-red: #ef4444;
+            --accent-green: #10b981;
+            --accent-purple: #8b5cf6;
+            --text-main: #f3f4f6;
+            --text-muted: #9ca3af;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            background-color: var(--bg-dark);
+            color: var(--text-main);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            overflow-x: hidden;
+        }
+
+        /* Header Bar */
+        header {
+            background: rgba(15, 23, 42, 0.85);
+            backdrop-filter: blur(16px);
+            border-bottom: 1px solid var(--border-color);
+            padding: 1rem 2rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            position: sticky;
+            top: 0;
+            z-index: 100;
+        }
+
+        .brand {
+            display: flex;
+            align-items: center;
+            gap: 0.8rem;
+        }
+
+        .brand-logo {
+            width: 38px;
+            height: 38px;
+            background: linear-gradient(135deg, var(--accent-blue), var(--accent-purple));
+            border-radius: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 800;
+            font-size: 1.1rem;
+            box-shadow: 0 4px 15px rgba(59, 130, 246, 0.3);
+        }
+
+        .brand-title {
+            font-size: 1.25rem;
+            font-weight: 700;
+            letter-spacing: -0.5px;
+        }
+
+        .brand-subtitle {
+            font-size: 0.75rem;
+            color: var(--accent-blue);
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        .system-status {
+            display: flex;
+            align-items: center;
+            gap: 0.6rem;
+            background: rgba(16, 185, 129, 0.1);
+            border: 1px solid rgba(16, 185, 129, 0.3);
+            padding: 0.4rem 1rem;
+            border-radius: 20px;
+            font-size: 0.85rem;
+            color: var(--accent-green);
+            font-weight: 600;
+        }
+
+        .pulse-dot {
+            width: 8px;
+            height: 8px;
+            background-color: var(--accent-green);
+            border-radius: 50%;
+            animation: pulse 1.8s infinite;
+        }
+
+        @keyframes pulse {
+            0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7); }
+            70% { transform: scale(1); box-shadow: 0 0 0 8px rgba(16, 185, 129, 0); }
+            100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }
+        }
+
+        /* Layout Grid */
+        .dashboard-container {
+            max-width: 1600px;
+            margin: 0 auto;
+            padding: 1.5rem 2rem;
+            width: 100%;
+            display: grid;
+            grid-template-columns: 2.2fr 1fr;
+            gap: 1.5rem;
+        }
+
+        /* Video Feed Section */
+        .feed-card {
+            background: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 16px;
+            overflow: hidden;
+            backdrop-filter: blur(12px);
+            display: flex;
+            flex-direction: column;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+        }
+
+        .card-header {
+            padding: 1rem 1.5rem;
+            background: rgba(255, 255, 255, 0.02);
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .card-title {
+            font-size: 1rem;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .source-controls {
+            display: flex;
+            gap: 0.5rem;
+        }
+
+        .btn {
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid var(--border-color);
+            color: var(--text-main);
+            padding: 0.4rem 0.9rem;
+            border-radius: 8px;
+            font-size: 0.82rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+
+        .btn:hover {
+            background: rgba(59, 130, 246, 0.2);
+            border-color: var(--accent-blue);
+            color: white;
+        }
+
+        .btn.active {
+            background: var(--accent-blue);
+            border-color: var(--accent-blue);
+            color: white;
+            box-shadow: 0 0 12px rgba(59, 130, 246, 0.4);
+        }
+
+        .video-wrapper {
+            position: relative;
+            width: 100%;
+            background: #000;
+            aspect-ratio: 16 / 9;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            overflow: hidden;
+        }
+
+        .video-stream {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+        }
+
+        .overlay-badge {
+            position: absolute;
+            top: 1rem;
+            left: 1rem;
+            background: rgba(0, 0, 0, 0.7);
+            border: 1px solid rgba(239, 68, 68, 0.5);
+            color: var(--accent-red);
+            padding: 0.3rem 0.8rem;
+            border-radius: 6px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.8rem;
+            font-weight: 700;
+            letter-spacing: 0.5px;
+            display: flex;
+            align-items: center;
+            gap: 0.4rem;
+        }
+
+        .rec-dot {
+            width: 6px;
+            height: 6px;
+            background-color: var(--accent-red);
+            border-radius: 50%;
+            animation: blink 1s infinite;
+        }
+
+        @keyframes blink {
+            50% { opacity: 0; }
+        }
+
+        /* Metrics Bar */
+        .metrics-grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 1rem;
+            padding: 1.2rem 1.5rem;
+            border-top: 1px solid var(--border-color);
+            background: rgba(15, 23, 42, 0.4);
+        }
+
+        .metric-card {
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid var(--border-color);
+            padding: 0.8rem 1rem;
+            border-radius: 10px;
+        }
+
+        .metric-label {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            font-weight: 500;
+            margin-bottom: 0.2rem;
+            text-transform: uppercase;
+        }
+
+        .metric-val {
+            font-size: 1.3rem;
+            font-weight: 700;
+            font-family: 'JetBrains Mono', monospace;
+            color: var(--text-main);
+        }
+
+        /* Sidebar Panels */
+        .sidebar {
+            display: flex;
+            flex-direction: column;
+            gap: 1.5rem;
+        }
+
+        .panel-card {
+            background: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 16px;
+            backdrop-filter: blur(12px);
+            padding: 1.2rem 1.5rem;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+            display: flex;
+            flex-direction: column;
+            max-height: 580px;
+        }
+
+        .event-list {
+            margin-top: 1rem;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 0.6rem;
+            padding-right: 0.3rem;
+        }
+
+        .event-list::-webkit-scrollbar {
+            width: 4px;
+        }
+
+        .event-list::-webkit-scrollbar-thumb {
+            background: rgba(255, 255, 255, 0.15);
+            border-radius: 4px;
+        }
+
+        .event-item {
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid var(--border-color);
+            border-left: 3px solid var(--accent-red);
+            padding: 0.75rem 1rem;
+            border-radius: 8px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 0.85rem;
+            animation: fadeIn 0.3s ease;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(-5px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .event-item.exited {
+            border-left-color: var(--accent-blue);
+        }
+
+        .event-info {
+            display: flex;
+            flex-direction: column;
+            gap: 0.15rem;
+        }
+
+        .event-title {
+            font-weight: 600;
+            color: white;
+        }
+
+        .event-sub {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+        }
+
+        .event-badge {
+            font-size: 0.72rem;
+            font-weight: 700;
+            padding: 0.2rem 0.6rem;
+            border-radius: 4px;
+            text-transform: uppercase;
+            font-family: 'JetBrains Mono', monospace;
+        }
+
+        .badge-entered {
+            background: rgba(239, 68, 68, 0.2);
+            color: var(--accent-red);
+            border: 1px solid rgba(239, 68, 68, 0.4);
+        }
+
+        .badge-exited {
+            background: rgba(59, 130, 246, 0.2);
+            color: var(--accent-blue);
+            border: 1px solid rgba(59, 130, 246, 0.4);
+        }
+
+        .banner-warning {
+            background: rgba(245, 158, 11, 0.15);
+            border: 1px solid rgba(245, 158, 11, 0.4);
+            color: #fbbf24;
+            padding: 0.6rem 1rem;
+            border-radius: 8px;
+            font-size: 0.82rem;
+            margin-bottom: 0.8rem;
+            display: none;
+        }
+
+        @media (max-width: 1100px) {
+            .dashboard-container {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <div class="brand">
+            <div class="brand-logo">IB</div>
+            <div>
+                <div class="brand-title">IBVAP AI Sentinel</div>
+                <div class="brand-subtitle">Intelligent Border Video Analytics Platform</div>
+            </div>
+        </div>
+        <div class="system-status">
+            <div class="pulse-dot"></div>
+            <span>SURVEILLANCE ENGINE LIVE</span>
+        </div>
+    </header>
+
+    <div class="dashboard-container">
+        <!-- Main Video & Control Column -->
+        <div class="feed-card">
+            <div class="card-header">
+                <div class="card-title">
+                    <span>📹 Live Surveillance Feed</span>
+                </div>
+                <div class="source-controls">
+                    <button id="btn-webcam" class="btn active" onclick="switchSource('webcam')">Live Webcam</button>
+                    <button id="btn-sample" class="btn" onclick="switchSource('sample')">Synthetic Test Feed</button>
+                </div>
+            </div>
+
+            <div class="video-wrapper">
+                <div class="overlay-badge">
+                    <div class="rec-dot"></div> AI INFERENCE ACTIVE
+                </div>
+                <img id="stream-img" src="/video_feed" class="video-stream" alt="Live AI Stream">
+            </div>
+
+            <div class="metrics-grid">
+                <div class="metric-card">
+                    <div class="metric-label">Inference Speed</div>
+                    <div class="metric-val" id="val-fps">0.0 <span style="font-size: 0.75rem;">FPS</span></div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-label">Active Objects</div>
+                    <div class="metric-val" id="val-tracks">0</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-label">Total Detections</div>
+                    <div class="metric-val" id="val-detections">0</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-label">Virtual Fence Alerts</div>
+                    <div class="metric-val" id="val-events" style="color: var(--accent-red);">0</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Event Logs Column -->
+        <div class="sidebar">
+            <div class="panel-card">
+                <div class="card-title" style="margin-bottom: 0.8rem;">
+                    <span>🚨 Virtual Fence Intrusion Events</span>
+                </div>
+                
+                <div id="warning-banner" class="banner-warning"></div>
+
+                <div id="event-list" class="event-list">
+                    <div style="text-align: center; color: var(--text-muted); font-size: 0.85rem; padding: 2rem 0;">
+                        No zone events recorded yet. Monitoring active perimeter...
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        async function fetchStats() {
+            try {
+                const res = await fetch('/api/stats');
+                const data = await res.json();
+                
+                document.getElementById('val-fps').innerHTML = `${data.fps} <span style="font-size: 0.75rem;">FPS</span>`;
+                document.getElementById('val-tracks').innerText = data.active_tracks;
+                document.getElementById('val-detections').innerText = data.total_detections;
+                document.getElementById('val-events').innerText = data.total_events;
+
+                const warnBanner = document.getElementById('warning-banner');
+                if (data.error_message) {
+                    warnBanner.innerText = `ℹ️ Note: ${data.error_message}`;
+                    warnBanner.style.display = 'block';
+                } else {
+                    warnBanner.style.display = 'none';
+                }
+            } catch (err) {
+                console.error("Stats fetch error:", err);
+            }
+        }
+
+        async function fetchEvents() {
+            try {
+                const res = await fetch('/api/events');
+                const events = await res.json();
+                const container = document.getElementById('event-list');
+
+                if (!events || events.length === 0) {
+                    container.innerHTML = `<div style="text-align: center; color: var(--text-muted); font-size: 0.85rem; padding: 2rem 0;">No zone events recorded yet. Monitoring active perimeter...</div>`;
+                    return;
+                }
+
+                container.innerHTML = events.map(evt => `
+                    <div class="event-item ${evt.event_type}">
+                        <div class="event-info">
+                            <div class="event-title">#${evt.tracker_id} ${evt.class_name}</div>
+                            <div class="event-sub">${evt.zone_name} • Frame ${evt.frame_idx}</div>
+                        </div>
+                        <div>
+                            <span class="event-badge badge-${evt.event_type}">${evt.event_type} @ ${evt.timestamp}</span>
+                        </div>
+                    </div>
+                `).join('');
+            } catch (err) {
+                console.error("Events fetch error:", err);
+            }
+        }
+
+        async function switchSource(type) {
+            document.getElementById('btn-webcam').classList.toggle('active', type === 'webcam');
+            document.getElementById('btn-sample').classList.toggle('active', type === 'sample');
+
+            try {
+                await fetch('/api/switch_source', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ type: type })
+                });
+                
+                // Refresh stream img element to force reconnect
+                const img = document.getElementById('stream-img');
+                img.src = '/video_feed?' + new Date().getTime();
+            } catch (err) {
+                console.error("Source switch error:", err);
+            }
+        }
+
+        setInterval(fetchStats, 1000);
+        setInterval(fetchEvents, 1000);
+    </script>
+</body>
+</html>
