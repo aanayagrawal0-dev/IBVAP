@@ -32,7 +32,7 @@ export function Sidebar({ operatorId = "OP-774" }: { operatorId?: string }) {
           <div className="flex items-center gap-2">
             <ShieldCheck className="h-5 w-5 text-safety-500" aria-hidden="true" />
             <span className="font-headline text-lg font-bold tracking-tight2 text-ink">
-              SENTINEL-X
+              PRAHARI
             </span>
           </div>
           <p className="mt-1 text-[11px] uppercase tracking-wide2 text-ink-dim">

@@ -38,7 +38,7 @@ export default function LoginPage() {
             <ShieldCheck className="h-6 w-6 text-safety-500" aria-hidden="true" />
           </div>
           <h1 className="font-headline text-xl font-bold tracking-tight2 text-ink">
-            SENTINEL-X
+            PRAHARI
           </h1>
           <p className="mt-1 text-[11px] uppercase tracking-wide2 text-ink-dim">
             Border Security Hub — Operator Access
