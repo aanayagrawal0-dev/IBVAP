@@ -12,6 +12,10 @@ dashboard — without needing new camera hardware.
 - **Detection & tracking** — Two-Model Top-Down Architecture: YOLOv11 (`ultralytics`) detects people/vehicles, and YOLOv11-Pose runs on cropped person bboxes;
   ByteTrack (`supervision`) assigns each one a persistent ID so it can be followed across
   frames instead of re-detected from scratch every time.
+- **Real AI Night Vision Enhancement** — a Zero-DCE++ deep-learning illumination engine dynamically brightens pitch-black video feeds under `torch.no_grad()` in FP16 precision. Includes an automatic high-speed LAB-space CLAHE fallback for standard CPU environments.
+- **Spatial-Temporal & Threat Behavior Rules** — geometric climbing/crawling pose checks (evaluating wrist-to-head and torso-to-knee ratios), loitering dwell timers (firing if a target remains in a zone >10s), and approach velocity vector checks.
+- **Cross-Camera Target Re-Identification (Re-ID)** — an integrated `GlobalTargetRegistry` that uses sparse OSNet feature embeddings to match identities across disjointed camera feeds, backed by an automatic HSV color histogram fallback.
+- **Hardware Acceleration** — automated hardware detection compiling models into TensorRT (FP16) `.engine` artifacts for NVIDIA CUDA or OpenVINO execution directories for Intel CPUs, protected by thread synchronization locks.
 - **Virtual fence / zone intrusion** — a configurable polygon zone; entering/exiting it fires a
   debounced alert (a 3-frame confirmation window stops flicker at the polygon edge from
   spamming alerts).
@@ -22,10 +26,7 @@ dashboard — without needing new camera hardware.
   configurable via its own environment variable (see "Running it" below). Switching cameras in
   the Live Feed page shows that camera's actual video and actual zones — a camera with no
   source configured just shows the offline placeholder instead of hanging.
-- **Simulated thermal / night-vision toggle** — a false-color heat-map overlay for low-light
-  viewing, applied server-side and clearly labeled as simulated (there's no real IR sensor
-  involved).
-- **Live dashboard** — a Next.js frontend ("SENTINEL-X") with a live annotated video feed, a
+- **Live dashboard** — a Next.js frontend ("PRAHARI") with a live annotated video feed, a
   real-time alert feed over WebSocket, a zone-drawing tool, an event history table, and an
   analytics view.
 - **Event history with real thumbnails, backed by a database** — every zone-crossing event
@@ -39,7 +40,7 @@ dashboard — without needing new camera hardware.
   `GET /api/analytics/report.pdf`, which builds a PDF (summary counts by severity/camera, time
   range covered, and the recent event log) straight from the history database and downloads it.
 - **Gemini-powered event explanations** — click any row in the History table and it expands to
-  show a plain-language explanation from Gemini: what the event means, what's visible in the
+  show a plain-language explanation from Gemini 2.5 Flash: what the event means, what's visible in the
   captured thumbnail, and whether the assigned severity looks reasonable. Generated on demand
   (nothing is called automatically for every logged event) and cached in the database once
   generated, so re-expanding the same row — or a teammate opening it later — doesn't re-spend API
@@ -76,11 +77,8 @@ Being upfront about this so it doesn't surprise anyone during a demo or a judge'
   which may be a short list on a freshly started backend.
 - Only cameras with a **source actually configured** run live — CAM-01/02/03 have defaults
   (webcam / bundled clip / bundled clip), CAM-04 doesn't, so it shows the offline placeholder
-  until you give it a source. The repo only ships one recorded demo clip, so CAM-02 and CAM-03
-  both play it by default (as two fully independent decodes, not a shared/mirrored stream) —
-  point them at your own footage via their env vars for visually distinct feeds. Running several
-  concurrent YOLO pipelines is real CPU work; if your machine struggles, disable a camera by
-  clearing its env var rather than running all four.
+  until you give it a source. The repo ships with several recorded demo clips in `sample_data/`, so CAM-02 and CAM-03
+  can play them (as fully independent decodes) — point them at your own footage or different demo clips via their env vars for visually distinct feeds. Running several concurrent YOLO pipelines is real CPU work; if your machine struggles, disable a camera by clearing its env var rather than running all four.
 - **ANPR (license plate recognition)** and **face detection** are on the roadmap but not built.
 - The **login gate is client-side only** — credentials are hardcoded in the frontend bundle and
   the backend API itself doesn't check any token. It's a convenience gate for a demo, not
@@ -88,7 +86,7 @@ Being upfront about this so it doesn't surprise anyone during a demo or a judge'
 
 ## Architecture
 
-```
+```text
                      ┌────────────────────────┐
   Video source ───▶ │   backend (Python)     │
   (file / webcam /  │  ingestion → YOLOv11 →  │
@@ -101,7 +99,7 @@ Being upfront about this so it doesn't surprise anyone during a demo or a judge'
                                 ▼
                     ┌────────────────────────┐
                     │  frontend (Next.js)    │
-                    │  SENTINEL-X dashboard  │
+                    │  PRAHARI dashboard     │
                     └────────────────────────┘
 ```
 
@@ -109,22 +107,25 @@ See `IBVAP_Technical_Architecture.md` for the fuller design writeup.
 
 ## Project structure
 
-```
+```text
 backend/
   src/
     ingestion.py      — video source wrapper (file / webcam / RTSP), auto-reconnect
-    detector.py        — YOLOv8 wrapper, filters to person/vehicle classes
+    detector.py        — YOLOv11 and YOLOv11-Pose Two-Model detector, filters to person/vehicle classes
     tracker.py          — ByteTrack wrapper, keeps trajectory history
+    zero_dce.py          — Zero-DCE++ neural illumination network & CLAHE fallback
+    reid.py              — TargetEmbedder & cross-camera GlobalTargetRegistry
+    export_models.py      — Hardware auto-detection & TensorRT/OpenVINO exporter
     zones.py             — polygon zone + debounced enter/exit events, multi-zone ZoneManager
     zone_store.py          — JSON-file persistence for per-camera zone configs
     history_store.py         — SQLite persistence for the event history log + thumbnails
     gemini_explainer.py        — calls Gemini to explain one history event, on demand
     pipeline.py                  — wires the above together; run() writes to file, stream() serves live
-    api_server.py                  — FastAPI bridge: MJPEG stream, alerts WebSocket, thermal toggle,
+    api_server.py                  — FastAPI bridge: MJPEG stream, alerts WebSocket,
                                       zone config CRUD, history query/export, PDF report, Gemini explain
   tests/                          — smoke tests + synthetic demo clip generator
-  sample_data/                     — demo video clip + stills
-  models/                           — YOLOv8 weights
+  sample_data/                     — bundled demo video clips (drone, fence climbing, etc.)
+  models/                           — YOLOv11 and YOLOv11-Pose weights / TensorRT engines
   zone_config.json                   — saved zones per camera (created on first run)
   history.db                          — event history database (created on first run)
   history_thumbnails/                  — one JPEG per logged event (created on first run)
@@ -150,21 +151,21 @@ python -m uvicorn src.api_server:app --port 8000
 Each camera has its own source, set independently via its own env var before starting the
 server — `IBVAP_CAM01_SOURCE`, `IBVAP_CAM02_SOURCE`, `IBVAP_CAM03_SOURCE`, `IBVAP_CAM04_SOURCE`.
 Leave one unset/empty and that camera just isn't run (offline placeholder in the UI). Defaults:
-CAM-01 → your webcam (`0`), CAM-02/03 → the bundled demo clip, CAM-04 → off.
+CAM-01 → your webcam (`0`), CAM-02/03 → the bundled demo clips, CAM-04 → off.
 
 ```powershell
 # PowerShell (Windows)
-$env:IBVAP_CAM01_SOURCE = "0"                          # laptop/USB webcam
-$env:IBVAP_CAM02_SOURCE = "rtsp://192.168.1.50/..."    # a real IP camera
-$env:IBVAP_CAM03_SOURCE = "sample_data/your_clip.mp4"  # your own recorded clip
-$env:IBVAP_CAM04_SOURCE = ""                           # leave off / clear to disable
+$env:IBVAP_CAM01_SOURCE = "0"                                     # laptop/USB webcam
+$env:IBVAP_CAM02_SOURCE = "sample_data/demo_fence_climb.mp4"      # bundled fence climbing demo
+$env:IBVAP_CAM03_SOURCE = "sample_data/demo_drone.mp4"            # bundled drone view demo
+$env:IBVAP_CAM04_SOURCE = ""                                      # leave off / clear to disable
 ```
 
 ```zsh
 # zsh/bash (macOS/Linux)
 export IBVAP_CAM01_SOURCE="0"
-export IBVAP_CAM02_SOURCE="rtsp://192.168.1.50/..."
-export IBVAP_CAM03_SOURCE="sample_data/your_clip.mp4"
+export IBVAP_CAM02_SOURCE="sample_data/demo_fence_climb.mp4"
+export IBVAP_CAM03_SOURCE="sample_data/demo_drone.mp4"
 unset IBVAP_CAM04_SOURCE
 ```
 
@@ -212,7 +213,7 @@ Without a key at all, expanding a row shows a clear "GEMINI_API_KEY is not set" 
 of failing silently — nothing else on the page is affected. If you have a key set and still get
 an error when expanding a row, the message includes a specific hint for the failure Google
 returned (wrong key type, quota exceeded, etc.) rather than just the raw error text. The model
-used defaults to `gemini-3.6-flash`; override it with `GEMINI_MODEL` (in `.env` or exported) if
+used defaults to `gemini-2.5-flash`; override it with `GEMINI_MODEL` (in `.env` or exported) if
 you want a different one. Each explanation is generated once (on first expand) and cached in
 `history.db`, so it only calls the API once per event no matter how many times it's viewed
 afterward.
@@ -231,7 +232,7 @@ Open `http://localhost:3000`. You'll land on the login screen first.
 
 | Operator ID | Passcode |
 |---|---|
-| `OP-774` | `sentinel2026` |
+| `OP-774` | `prahari2026` |
 | `OP-118` | `border-watch` |
 
 (Defined in `frontend/lib/auth.ts` — change or add operators there.)
@@ -272,7 +273,7 @@ for the Gemini explanations, `python-dotenv` for the `.env` file support above).
 
 ## Tech stack
 
-- **Backend**: Python, OpenCV, YOLOv8 (Ultralytics), ByteTrack (`supervision`), FastAPI, uvicorn,
+- **Backend**: Python, OpenCV, YOLOv11 and YOLOv11-Pose (Ultralytics), ByteTrack (`supervision`), FastAPI, uvicorn,
   SQLite (event history), fpdf2 (PDF report generation), google-genai (Gemini explanations),
   python-dotenv (`.env` config)
 - **Frontend**: Next.js 14 (App Router), TypeScript, Tailwind CSS, framer-motion, recharts
@@ -280,11 +281,7 @@ for the Gemini explanations, `python-dotenv` for the `.env` file support above).
 
 ## Known caveats
 
-- The bundled `sample_data/synthetic_test_clip.mp4` is a synthetic stand-in built by
-  panning across stock stills — not real CCTV footage. Use webcam mode (see above) for a more
-  convincing live demo.
-- The thermal toggle is a false-color visible-light transform (`cv2.applyColorMap`), not a
-  real infrared sensor — it's labeled "SIMULATED" everywhere it appears in the UI and API.
+- The bundled clips in `sample_data/` (e.g., `demo_fence_climb.mp4`, `demo_drone.mp4`) are provided for testing different surveillance angles. Use webcam mode (see above) for a live demonstration.
 - `npm audit` flags some known Next.js 14.x advisories that are primarily server-side attack
   vectors (middleware, server actions); given this runs on localhost for a demo, we judged the
   risk of a mid-hackathon major-version jump to Next 16 higher than the risk of the advisories
