@@ -7,6 +7,9 @@ loitering duration tracking, and approach velocity monitoring.
 
 import math
 import time
+
+# Vehicle COCO class IDs — skeletal pose checks are meaningless for these.
+VEHICLE_CLASS_IDS = {2, 3, 5, 7}  # car, motorcycle, bus, truck
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -119,7 +122,7 @@ class Zone:
     def contains(self, x, y):
         return _point_in_polygon(x, y, self.polygon)
 
-    def update(self, tracker_id, cx, cy, frame_idx, keypoints_xy=None, keypoints_conf=None):
+    def update(self, tracker_id, cx, cy, frame_idx, keypoints_xy=None, keypoints_conf=None, class_id=None):
         """Call once per tracked object per frame. Returns a ZoneEvent if a
         crossing, threat behavior, loitering, or high-velocity approach occurred."""
         raw_inside = self.contains(cx, cy)
@@ -172,7 +175,8 @@ class Zone:
                 self._velocity_fired[tracker_id] = False
 
         # --- Pose Threat Behaviors (climbing/crawling) ---
-        if raw_inside or candidate_state:
+        # Skip skeletal analysis entirely for vehicle targets.
+        if (raw_inside or candidate_state) and (class_id is None or class_id not in VEHICLE_CLASS_IDS):
             threat = check_threat_behavior(keypoints_xy, keypoints_conf)
             if threat is not None:
                 last_threat = self._threat_state.get(tracker_id)
@@ -210,11 +214,11 @@ class ZoneManager:
     def replace_zones(self, zones: list):
         self.zones = list(zones)
 
-    def update(self, tracker_id, cx, cy, frame_idx, keypoints_xy=None, keypoints_conf=None):
+    def update(self, tracker_id, cx, cy, frame_idx, keypoints_xy=None, keypoints_conf=None, class_id=None):
         """Runs all zones for one tracked centroid and keypoints; returns list of ZoneEvents."""
         events = []
         for zone in self.zones:
-            evt = zone.update(tracker_id, cx, cy, frame_idx, keypoints_xy, keypoints_conf)
+            evt = zone.update(tracker_id, cx, cy, frame_idx, keypoints_xy, keypoints_conf, class_id=class_id)
             if evt:
                 events.append(evt)
         return events
