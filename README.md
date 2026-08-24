@@ -9,7 +9,7 @@ dashboard — without needing new camera hardware.
 
 ## What's working right now
 
-- **Detection & tracking** — YOLOv8 (`ultralytics`) detects people/vehicles per frame;
+- **Detection & tracking** — Two-Model Top-Down Architecture: YOLOv11 (`ultralytics`) detects people/vehicles, and YOLOv11-Pose runs on cropped person bboxes;
   ByteTrack (`supervision`) assigns each one a persistent ID so it can be followed across
   frames instead of re-detected from scratch every time.
 - **Virtual fence / zone intrusion** — a configurable polygon zone; entering/exiting it fires a
@@ -81,9 +81,7 @@ Being upfront about this so it doesn't surprise anyone during a demo or a judge'
   point them at your own footage via their env vars for visually distinct feeds. Running several
   concurrent YOLO pipelines is real CPU work; if your machine struggles, disable a camera by
   clearing its env var rather than running all four.
-- **ANPR (license plate recognition)**, **face detection**, **suspicious-activity rules**
-  (loitering, approach velocity), and a **dedicated night-time image-enhancement stage** (as
-  opposed to the simulated thermal *display* toggle) are on the roadmap but not built.
+- **ANPR (license plate recognition)** and **face detection** are on the roadmap but not built.
 - The **login gate is client-side only** — credentials are hardcoded in the frontend bundle and
   the backend API itself doesn't check any token. It's a convenience gate for a demo, not
   production security.
@@ -91,9 +89,9 @@ Being upfront about this so it doesn't surprise anyone during a demo or a judge'
 ## Architecture
 
 ```
-                    ┌────────────────────────┐
+                     ┌────────────────────────┐
   Video source ───▶ │   backend (Python)     │
-  (file / webcam /  │  ingestion → YOLOv8 →   │
+  (file / webcam /  │  ingestion → YOLOv11 →  │
    RTSP)            │  ByteTrack → zone logic │
                     │  FastAPI bridge server  │
                     └───────────┬────────────┘
