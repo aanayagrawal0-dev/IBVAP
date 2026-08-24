@@ -4,3 +4,4 @@ supervision>=0.21.0
 numpy>=1.26.0
 fastapi>=0.115.0
 uvicorn[standard]>=0.30.0
+fpdf2>=2.8.0

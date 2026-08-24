@@ -9,3 +9,7 @@ EOF
 *.zip
 backend/zone_config.json
 backend/zone_config.json
+backend/history.db
+backend/history.db-wal
+backend/history.db-shm
+backend/history_thumbnails/

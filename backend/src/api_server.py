@@ -22,6 +22,8 @@ Run with:  uvicorn src.api_server:app --reload --port 8000
 """
 
 import asyncio
+import csv
+import io
 import json
 import os
 import queue
@@ -32,12 +34,12 @@ from datetime import datetime
 import cv2
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 from src.pipeline import Pipeline
 from src.zones import Zone, ZoneManager, ZoneEventType
-from src import zone_store
+from src import history_store, zone_store
 
 
 def _parse_video_source(raw: str):
@@ -128,8 +130,10 @@ def _apply_thermal_colormap(bgr_frame):
 # --- One alert stream shared by every camera, each alert tagged with which
 # camera raised it ------------------------------------------------------
 _alert_queue: "queue.Queue[dict]" = queue.Queue(maxsize=200)
-_event_counter_lock = threading.Lock()
-_event_counter = 0
+
+# Thumbnails are stored at reduced size — a live 1280x720 frame doesn't
+# need to be saved full-res just to show "what triggered this" in History.
+THUMBNAIL_MAX_WIDTH = 320
 
 
 class CameraWorker:
@@ -193,20 +197,36 @@ class CameraWorker:
             with self.frame_lock:
                 self.latest_jpeg = buf.tobytes()
 
-    def _on_event(self, evt, class_name):
-        global _event_counter
-        with _event_counter_lock:
-            _event_counter += 1
-            event_id = _event_counter
+    def _on_event(self, evt, class_name, annotated_bgr):
         entered = evt.event_type == ZoneEventType.ENTERED
+        severity = "critical" if entered else "warning"
+        title = f"{class_name.upper()} {'ENTERED' if entered else 'EXITED'} ZONE"
+        description = (
+            f"Tracked object #{evt.tracker_id} ({class_name}) "
+            f"{'entered' if entered else 'exited'} '{evt.zone_name}'."
+        )
+
+        thumbnail_jpeg = self._make_thumbnail(annotated_bgr)
+
+        # The DB assigns the id (autoincrement) — reused as the live alert's
+        # id too, so a WebSocket alert and its History row always match.
+        event_id = history_store.insert_event(
+            camera_id=self.camera_id,
+            event_type=evt.event_type.value,
+            zone_name=evt.zone_name,
+            tracker_id=evt.tracker_id,
+            class_name=class_name,
+            severity=severity,
+            title=title,
+            description=description,
+            thumbnail_jpeg=thumbnail_jpeg,
+        )
+
         alert = {
             "id": f"evt-{event_id}",
-            "severity": "critical" if entered else "warning",
-            "title": f"{class_name.upper()} {'ENTERED' if entered else 'EXITED'} ZONE",
-            "description": (
-                f"Tracked object #{evt.tracker_id} ({class_name}) "
-                f"{'entered' if entered else 'exited'} '{evt.zone_name}'."
-            ),
+            "severity": severity,
+            "title": title,
+            "description": description,
             "camera": self.camera_id,
             "timestamp": datetime.now().strftime("%H:%M:%S"),
         }
@@ -214,6 +234,17 @@ class CameraWorker:
             _alert_queue.put_nowait(alert)
         except queue.Full:
             pass  # drop rather than block the CV thread if nobody's draining it
+
+    @staticmethod
+    def _make_thumbnail(annotated_bgr) -> bytes | None:
+        h, w = annotated_bgr.shape[:2]
+        if w > THUMBNAIL_MAX_WIDTH:
+            scale = THUMBNAIL_MAX_WIDTH / w
+            annotated_bgr = cv2.resize(
+                annotated_bgr, (THUMBNAIL_MAX_WIDTH, max(1, int(h * scale)))
+            )
+        ok, buf = cv2.imencode(".jpg", annotated_bgr, [cv2.IMWRITE_JPEG_QUALITY, 75])
+        return buf.tobytes() if ok else None
 
 
 # Only cameras with a non-empty configured source actually run. The rest
@@ -239,6 +270,7 @@ app.add_middleware(
 
 @app.on_event("startup")
 def _startup():
+    history_store.init_db()
     for camera in _cameras.values():
         camera.start()
 
@@ -375,3 +407,164 @@ async def ws_alerts(websocket: WebSocket):
                 await asyncio.sleep(0.2)
     except WebSocketDisconnect:
         pass
+
+
+# --- Event history --------------------------------------------------------
+# Real, queryable history backed by history_store.py (SQLite) — every
+# zone-crossing event across every camera lands here automatically via
+# CameraWorker._on_event, thumbnail included. This is what the History page
+# reads instead of a hardcoded array.
+MAX_HISTORY_LIMIT = 200
+
+
+def _history_filters(camera_id: str | None, severity: str | None, since_hours: float | None):
+    since_epoch = time.time() - since_hours * 3600 if since_hours else None
+    cam = camera_id if camera_id and camera_id.lower() != "all" else None
+    sev = severity if severity and severity.lower() != "all" else None
+    return cam, sev, since_epoch
+
+
+def _serialize_event(row: dict) -> dict:
+    return {
+        "id": row["id"],
+        "timestamp": row["ts_iso"].replace("T", " "),
+        "camera": row["camera_id"],
+        "eventType": row["title"],
+        "description": row["description"],
+        "trackerId": f"#{row['tracker_id']}",
+        "severity": row["severity"],
+        "thumbnailUrl": f"/api/history/thumbnail/{row['id']}" if row["has_thumbnail"] else None,
+    }
+
+
+@app.get("/api/history")
+def get_history(
+    camera_id: str | None = None,
+    severity: str | None = None,
+    since_hours: float | None = None,
+    limit: int = 50,
+    offset: int = 0,
+):
+    limit = max(1, min(limit, MAX_HISTORY_LIMIT))
+    offset = max(0, offset)
+    cam, sev, since_epoch = _history_filters(camera_id, severity, since_hours)
+    rows, total = history_store.query_events(
+        camera_id=cam, severity=sev, since_epoch=since_epoch, limit=limit, offset=offset
+    )
+    return {"events": [_serialize_event(r) for r in rows], "total": total}
+
+
+@app.get("/api/history/thumbnail/{event_id}")
+def get_history_thumbnail(event_id: int):
+    path = history_store.get_thumbnail_path(event_id)
+    if path is None:
+        return _error(f"No thumbnail stored for event {event_id}.", status_code=404)
+    return FileResponse(path, media_type="image/jpeg")
+
+
+@app.get("/api/history/export.csv")
+def export_history_csv(
+    camera_id: str | None = None,
+    severity: str | None = None,
+    since_hours: float | None = None,
+):
+    cam, sev, since_epoch = _history_filters(camera_id, severity, since_hours)
+    rows, _total = history_store.query_events(
+        camera_id=cam, severity=sev, since_epoch=since_epoch, limit=5000, offset=0
+    )
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["Timestamp", "Camera", "Event", "Tracker ID", "Severity", "Description"])
+    for r in rows:
+        writer.writerow(
+            [r["ts_iso"], r["camera_id"], r["title"], r["tracker_id"], r["severity"], r["description"]]
+        )
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return Response(
+        content=buf.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="ibvap_history_{stamp}.csv"'},
+    )
+
+
+@app.get("/api/analytics/report.pdf")
+def generate_analytics_report():
+    """Builds a real operational-report PDF straight from the event
+    history database — summary stats plus the recent event log. Backs the
+    Analytics page's "Generate Report" button (previously not wired to
+    anything)."""
+    from fpdf import FPDF  # imported lazily so a missing dep can't break the whole API
+    from fpdf.enums import XPos, YPos
+
+    NL = {"new_x": XPos.LMARGIN, "new_y": YPos.NEXT}  # shorthand for "cell, then newline"
+
+    stats = history_store.summary_stats()
+    recent_rows, _total = history_store.query_events(limit=100, offset=0)
+
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+
+    pdf.set_font("Helvetica", "B", 18)
+    pdf.cell(0, 10, "IBVAP Operational Report", **NL)
+    pdf.set_font("Helvetica", "", 10)
+    pdf.set_text_color(90, 90, 90)
+    pdf.cell(0, 6, f"Generated {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", **NL)
+    pdf.set_text_color(0, 0, 0)
+    pdf.ln(4)
+
+    pdf.set_font("Helvetica", "B", 13)
+    pdf.cell(0, 8, "Summary", **NL)
+    pdf.set_font("Helvetica", "", 11)
+    pdf.cell(0, 7, f"Total events logged: {stats['total']}", **NL)
+    if stats["earliest_ts"] and stats["latest_ts"]:
+        lo = datetime.fromtimestamp(stats["earliest_ts"]).strftime("%Y-%m-%d %H:%M:%S")
+        hi = datetime.fromtimestamp(stats["latest_ts"]).strftime("%Y-%m-%d %H:%M:%S")
+        pdf.cell(0, 7, f"Time range covered: {lo} to {hi}", **NL)
+    pdf.ln(2)
+
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.cell(0, 7, "By severity", **NL)
+    pdf.set_font("Helvetica", "", 10)
+    for sev in ("critical", "warning", "info"):
+        pdf.cell(0, 6, f"  {sev.upper()}: {stats['by_severity'].get(sev, 0)}", **NL)
+    pdf.ln(2)
+
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.cell(0, 7, "By camera", **NL)
+    pdf.set_font("Helvetica", "", 10)
+    if stats["by_camera"]:
+        for cam_id, n in sorted(stats["by_camera"].items()):
+            pdf.cell(0, 6, f"  {cam_id}: {n}", **NL)
+    else:
+        pdf.cell(0, 6, "  No events recorded yet.", **NL)
+    pdf.ln(4)
+
+    pdf.set_font("Helvetica", "B", 13)
+    pdf.cell(0, 8, f"Recent events (most recent {len(recent_rows)})", **NL)
+    pdf.set_font("Helvetica", "B", 9)
+    col_widths = (32, 22, 70, 20, 46)
+    for w, htxt in zip(col_widths, ["Timestamp", "Camera", "Event", "Tracker", "Severity"]):
+        pdf.cell(w, 7, htxt, border=1)
+    pdf.ln()
+    pdf.set_font("Helvetica", "", 8)
+    for r in recent_rows:
+        pdf.cell(col_widths[0], 6, r["ts_iso"].replace("T", " "), border=1)
+        pdf.cell(col_widths[1], 6, r["camera_id"], border=1)
+        pdf.cell(col_widths[2], 6, r["title"][:45], border=1)
+        pdf.cell(col_widths[3], 6, f"#{r['tracker_id']}", border=1)
+        pdf.cell(col_widths[4], 6, r["severity"].upper(), border=1)
+        pdf.ln()
+    if not recent_rows:
+        pdf.set_font("Helvetica", "", 10)
+        pdf.cell(0, 8, "No events recorded yet.", **NL)
+
+    pdf_bytes = bytes(pdf.output())
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="ibvap_report_{stamp}.pdf"'},
+    )

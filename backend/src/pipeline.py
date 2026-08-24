@@ -115,7 +115,11 @@ class Pipeline:
         """
         Callback-driven variant of run(), for serving a live feed instead of
         writing one file. Calls on_frame(annotated_bgr_frame) every frame and
-        on_event(zone_event, class_name) whenever a zone crossing fires.
+        on_event(zone_event, class_name, annotated_bgr_frame) whenever a zone
+        crossing fires — the annotated frame (boxes + zone overlay already
+        drawn) is handed over too so a caller can save it as a thumbnail
+        showing exactly what triggered the alert, without redoing any of
+        the drawing itself.
 
         loop=True replays a recorded file source indefinitely so a video file
         behaves like a continuous live camera for demo purposes — RTSP
@@ -139,6 +143,8 @@ class Pipeline:
                 frame_h, frame_w = frame.shape[:2]
 
                 labels = []
+                fired_this_frame = []  # (evt, class_name) — flushed once the
+                # annotated frame exists below, so thumbnails show boxes/zones.
                 for i in range(len(tracked)):
                     cls_id = int(tracked.class_id[i])
                     tid = int(tracked.tracker_id[i])
@@ -155,14 +161,17 @@ class Pipeline:
                     cx_pct, cy_pct = cx / frame_w * 100.0, cy / frame_h * 100.0
                     for evt in self.zone_manager.update(tid, cx_pct, cy_pct, idx):
                         self.events.append(evt)
-                        if on_event:
-                            on_event(evt, class_name)
+                        fired_this_frame.append((evt, class_name))
 
                 annotated = frame.copy()
                 annotated = self.box_annotator.annotate(annotated, tracked)
                 annotated = self.label_annotator.annotate(annotated, tracked, labels=labels)
                 annotated = self._draw_zones(annotated)
                 on_frame(annotated)
+
+                if on_event:
+                    for evt, class_name in fired_this_frame:
+                        on_event(evt, class_name, annotated)
 
                 if frame_interval:
                     elapsed = time.time() - t_start
