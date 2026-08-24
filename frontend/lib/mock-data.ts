@@ -15,15 +15,6 @@ export interface Camera {
   status: "nominal" | "alert" | "offline";
 }
 
-export interface HistoryEvent {
-  id: string;
-  timestamp: string;
-  camera: string;
-  eventType: string;
-  trackerId: string;
-  severity: Severity;
-}
-
 export const cameras: Camera[] = [
   { id: "CAM-01", label: "OUTPOST DUSK", status: "nominal" },
   { id: "CAM-02", label: "PASS", status: "nominal" },
@@ -101,56 +92,9 @@ export const alertStream: Omit<Alert, "id" | "timestamp">[] = [
   },
 ];
 
-export const historyEvents: HistoryEvent[] = [
-  {
-    id: "e1",
-    timestamp: "2026-08-23 23:14:05 UTC",
-    camera: "CAM-SZ-04",
-    eventType: "Perimeter Breach",
-    trackerId: "#42",
-    severity: "critical",
-  },
-  {
-    id: "e2",
-    timestamp: "2026-08-23 22:45:12 UTC",
-    camera: "CAM-NZ-12",
-    eventType: "Motion Detected — Zone B",
-    trackerId: "#38",
-    severity: "warning",
-  },
-  {
-    id: "e3",
-    timestamp: "2026-08-23 21:00:00 UTC",
-    camera: "SYS-CORE",
-    eventType: "Routine Diagnostic Complete",
-    trackerId: "—",
-    severity: "info",
-  },
-  {
-    id: "e4",
-    timestamp: "2026-08-23 19:33:45 UTC",
-    camera: "CAM-EZ-01",
-    eventType: "Signal Lost — Tamper Suspected",
-    trackerId: "—",
-    severity: "critical",
-  },
-  {
-    id: "e5",
-    timestamp: "2026-08-23 18:12:31 UTC",
-    camera: "CAM-03",
-    eventType: "Vehicle Classified — Truck",
-    trackerId: "#31",
-    severity: "info",
-  },
-  {
-    id: "e6",
-    timestamp: "2026-08-23 17:58:02 UTC",
-    camera: "CAM-01",
-    eventType: "Loitering — Dwell 62s",
-    trackerId: "#29",
-    severity: "warning",
-  },
-];
+// Event history is no longer mocked here — the History page reads real,
+// database-backed events from the backend (see lib/history.ts and
+// backend/src/history_store.py).
 
 export const breachTrend = Array.from({ length: 30 }, (_, i) => ({
   day: i + 1,

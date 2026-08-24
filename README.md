@@ -28,11 +28,28 @@ dashboard — without needing new camera hardware.
 - **Live dashboard** — a Next.js frontend ("SENTINEL-X") with a live annotated video feed, a
   real-time alert feed over WebSocket, a zone-drawing tool, an event history table, and an
   analytics view.
+- **Event history with real thumbnails, backed by a database** — every zone-crossing event
+  (across every camera) is written to a SQLite database (`backend/history.db`) the instant it
+  fires, along with a JPEG thumbnail of the actual annotated frame that triggered it (boxes and
+  zone overlay included) saved to `backend/history_thumbnails/`. The History page reads this
+  live through `GET /api/history` — real pagination, and severity/date-range filters that
+  actually query the database — instead of a hardcoded list. **Export Log** downloads the
+  currently filtered log as a CSV, generated server-side from the same database.
+- **Operational report generation** — **Generate Report** on the Analytics page calls
+  `GET /api/analytics/report.pdf`, which builds a PDF (summary counts by severity/camera, time
+  range covered, and the recent event log) straight from the history database and downloads it.
 - **Multi-zone, multi-camera zone configuration** — draw any number of restricted-area polygons
   per camera (not just one), saved to disk (`backend/zone_config.json`) and loaded through
   `GET/PUT /api/zones/{camera_id}`. Whichever camera is currently live picks up a saved change
   immediately — no server restart — and every other camera's zones sit ready for the moment
-  that feed is connected.
+  that feed is connected. Zones are stored as **percentages (0-100) of frame width/height**, not
+  pixels, and converted to each frame's actual pixel coordinates on the fly — so a zone drawn
+  against the Zone Config preview lines up correctly on the real feed no matter that camera's
+  native resolution (a 960x540 recorded clip, a 1280x720 webcam, or anything else).
+- **Alert filtering by camera** — the Live Alerts panel has a row of filter chips ("All" plus one
+  per camera) above the list, so a busy multi-camera feed doesn't turn into a wall of alerts.
+  Select one camera to see only its alerts, select several for a combined view, or leave "All"
+  selected (the default) to see everything.
 - **Operator login gate** — a lightweight, demo-grade sign-in screen so the dashboard isn't
   wide open to anyone at the keyboard.
 
@@ -40,12 +57,16 @@ dashboard — without needing new camera hardware.
 
 Being upfront about this so it doesn't surprise anyone during a demo or a judge's questions:
 
-- The **Live Feed** and **Zone Config** pages are connected to the real backend (real MJPEG
-  stream, real WebSocket alerts, real zone persistence). Live Feed falls back to generated mock
-  alerts after a few seconds if the backend isn't reachable, so the UI still demos standalone.
-- **History** and **Analytics** pages still run on mock/static data — there's no persistent
-  event log/database behind the history table yet (alerts exist only as they stream over the
-  WebSocket; nothing's written to disk for later browsing).
+- The **Live Feed**, **Zone Config**, and **History** pages are connected to the real backend
+  (real MJPEG stream, real WebSocket alerts, real zone persistence, real event database). Live
+  Feed falls back to generated mock alerts after a few seconds if the backend isn't reachable, so
+  the UI still demos standalone; History instead shows an explicit "couldn't reach the history
+  service" message rather than silently showing fake data.
+- The **Analytics** page's summary stat cards, 30-day breach trend chart, and activity heatmap
+  are still mock/static data — genuine trend analysis needs history to accumulate over real time,
+  which a fresh demo database won't have yet. **Generate Report** is the one part of that page
+  wired to the real database (see above) — it exports whatever has actually been logged so far,
+  which may be a short list on a freshly started backend.
 - Only cameras with a **source actually configured** run live — CAM-01/02/03 have defaults
   (webcam / bundled clip / bundled clip), CAM-04 doesn't, so it shows the offline placeholder
   until you give it a source. The repo only ships one recorded demo clip, so CAM-02 and CAM-03
@@ -91,19 +112,23 @@ backend/
     tracker.py          — ByteTrack wrapper, keeps trajectory history
     zones.py             — polygon zone + debounced enter/exit events, multi-zone ZoneManager
     zone_store.py          — JSON-file persistence for per-camera zone configs
-    pipeline.py              — wires the above together; run() writes to file, stream() serves live
-    api_server.py              — FastAPI bridge: MJPEG stream, alerts WebSocket, thermal toggle,
-                                  zone config CRUD
-  tests/                        — smoke tests + synthetic demo clip generator
-  sample_data/                   — demo video clip + stills
-  models/                         — YOLOv8 weights
-  zone_config.json                 — saved zones per camera (created on first run)
+    history_store.py         — SQLite persistence for the event history log + thumbnails
+    pipeline.py                — wires the above together; run() writes to file, stream() serves live
+    api_server.py                — FastAPI bridge: MJPEG stream, alerts WebSocket, thermal toggle,
+                                    zone config CRUD, history query/export, PDF report generation
+  tests/                          — smoke tests + synthetic demo clip generator
+  sample_data/                     — demo video clip + stills
+  models/                           — YOLOv8 weights
+  zone_config.json                   — saved zones per camera (created on first run)
+  history.db                          — event history database (created on first run)
+  history_thumbnails/                  — one JPEG per logged event (created on first run)
 
 frontend/
   app/                        — pages: /login, /live, /zone-config, /history, /analytics
   components/                  — Sidebar, VideoPanel, AppShell (auth guard), alert list, etc.
   lib/                          — config.ts (backend URL), auth.ts (demo login), zones.ts (zone
-                                   config API client), mock-data.ts
+                                   config API client), history.ts (history query/export client),
+                                   mock-data.ts
 ```
 
 ## Running it
@@ -172,9 +197,27 @@ when you save its zones, no restart needed. Saving zones for a camera with no so
 still works and persists — they'll apply the moment you give that camera a source and restart
 the backend.
 
+### History & reports
+
+Every zone-crossing event, from every running camera, is logged automatically — nothing to turn
+on. Open **History** to see it: a real, paginated table backed by `backend/history.db`, complete
+with a thumbnail of the actual frame that triggered each event. **Date Range** and **Severity**
+filter by re-querying the database (not filtering an in-page list), and **Export Log** downloads
+whatever's currently filtered as a CSV.
+
+**Generate Report** on the **Analytics** page produces a PDF — summary counts by severity and by
+camera, the time range covered, and a table of recent events — built the moment you click it from
+whatever's in the database so far. On a freshly started backend with no events yet, it still
+generates, just with an empty/near-empty log; let the system run for a bit (or walk in front of
+the webcam) to see a fuller report.
+
+If you already had a `venv` set up before this update, run `pip install -r requirements.txt`
+again — the report feature added one new dependency (`fpdf2`).
+
 ## Tech stack
 
-- **Backend**: Python, OpenCV, YOLOv8 (Ultralytics), ByteTrack (`supervision`), FastAPI, uvicorn
+- **Backend**: Python, OpenCV, YOLOv8 (Ultralytics), ByteTrack (`supervision`), FastAPI, uvicorn,
+  SQLite (event history), fpdf2 (PDF report generation)
 - **Frontend**: Next.js 14 (App Router), TypeScript, Tailwind CSS, framer-motion, recharts
 - **Bridge**: MJPEG over HTTP for video, WebSocket for alert events
 
