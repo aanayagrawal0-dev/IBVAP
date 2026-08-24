@@ -28,7 +28,14 @@ class ZoneEvent:
 class Zone:
     """A restricted polygon (e.g. the virtual fence line/area)."""
     name: str
-    polygon: list  # list of (x, y) points, image coordinates
+    # list of (x, y) points as PERCENTAGES (0-100) of frame width/height —
+    # deliberately resolution-independent so the same zone is correct
+    # whether the source is a 960x540 recorded clip, a 1280x720 webcam, or
+    # anything else. contains()/update() below expect the tracked point
+    # passed in already converted to the same percentage space (see
+    # pipeline.py, which does that conversion using each frame's actual
+    # shape rather than any assumed constant).
+    polygon: list
     # A centroid sitting right on the polygon edge jitters in/out frame to
     # frame (tracker box noise, panning motion, etc.) — without debouncing
     # this produces an entered/exited flood instead of one clean crossing.
@@ -85,6 +92,15 @@ class ZoneManager:
 
     def add_zone(self, zone: Zone):
         self.zones.append(zone)
+
+    def replace_zones(self, zones: list):
+        """Atomically swap in a new zone list — used to hot-reload a live
+        camera's config from the zone-config UI without restarting the
+        pipeline thread. A plain list reassignment is safe to read
+        concurrently from the CV thread's update() loop under the GIL: a
+        frame mid-flight sees either the old list or the new one, never a
+        partially-built one."""
+        self.zones = list(zones)
 
     def update(self, tracker_id, cx, cy, frame_idx):
         """Runs all zones for one tracked centroid; returns list of ZoneEvents."""
