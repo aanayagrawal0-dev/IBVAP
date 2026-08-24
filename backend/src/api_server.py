@@ -32,10 +32,18 @@ import time
 from datetime import datetime
 
 import cv2
+from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
+
+# Loads backend/.env (if present) into os.environ before anything below
+# reads a config var — GEMINI_API_KEY, GEMINI_MODEL, the IBVAP_CAM*_SOURCE
+# vars, all of it. A shell-exported value always wins over .env (dotenv's
+# default: it never overrides a variable that's already set), so this is
+# purely a convenience — nothing breaks for anyone who prefers `export`.
+load_dotenv()
 
 from src.pipeline import Pipeline
 from src.zones import Zone, ZoneManager, ZoneEventType
@@ -460,6 +468,46 @@ def get_history_thumbnail(event_id: int):
     if path is None:
         return _error(f"No thumbnail stored for event {event_id}.", status_code=404)
     return FileResponse(path, media_type="image/jpeg")
+
+
+@app.post("/api/history/{event_id}/explain")
+def explain_history_event(event_id: int):
+    """On-demand only — nothing calls Gemini automatically for every logged
+    event. This fires the first time an operator expands a row in the
+    History page; the result is cached on the row (history_store.
+    set_explanation) so re-expanding it later, or another operator opening
+    the same event, doesn't spend API quota again."""
+    row = history_store.get_event(event_id)
+    if row is None:
+        return _error(f"No event with id {event_id}.", status_code=404)
+
+    if row.get("explanation"):
+        return {"explanation": row["explanation"], "cached": True}
+
+    try:
+        from src import gemini_explainer
+    except ImportError:
+        return _error(
+            "The google-genai package isn't installed on the backend. "
+            "Run: pip install google-genai",
+            status_code=503,
+        )
+
+    thumb_path = history_store.get_thumbnail_path(event_id)
+    thumbnail_jpeg = None
+    if thumb_path:
+        with open(thumb_path, "rb") as f:
+            thumbnail_jpeg = f.read()
+
+    try:
+        text = gemini_explainer.explain_event(row, thumbnail_jpeg)
+    except gemini_explainer.GeminiNotConfigured as exc:
+        return _error(str(exc), status_code=503)
+    except gemini_explainer.GeminiRequestFailed as exc:
+        return _error(f"Gemini request failed: {exc}", status_code=502)
+
+    history_store.set_explanation(event_id, text)
+    return {"explanation": text, "cached": False}
 
 
 @app.get("/api/history/export.csv")

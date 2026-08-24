@@ -51,3 +51,20 @@ export function thumbnailUrl(event: HistoryEvent): string | null {
 export function exportHistoryCsvUrl(filters: HistoryFilters = {}): string {
   return `${API_BASE}/api/history/export.csv?${buildParams(filters)}`;
 }
+
+/** On-demand Gemini explanation for one event — only called the first time
+ * a History row is expanded. The backend caches the result against the
+ * event, so a second expand (this session or a page reload) comes back
+ * instantly with cached: true rather than calling Gemini again. Throws
+ * with the backend's message on failure (no key configured, bad key,
+ * network error, etc.) so the row can show exactly what went wrong. */
+export async function explainEvent(
+  id: number
+): Promise<{ explanation: string; cached: boolean }> {
+  const res = await fetch(`${API_BASE}/api/history/${id}/explain`, { method: "POST" });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data.detail || `Failed to get explanation (${res.status})`);
+  }
+  return data;
+}

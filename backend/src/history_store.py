@@ -63,6 +63,14 @@ def init_db():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts_epoch)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_events_camera ON events(camera_id)")
 
+        # Migration for DBs created before the Gemini explanation feature —
+        # ALTER TABLE ADD COLUMN is safe/idempotent-checked here so an
+        # existing history.db with real logged events doesn't need to be
+        # wiped to pick this up.
+        existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(events)").fetchall()}
+        if "explanation" not in existing_cols:
+            conn.execute("ALTER TABLE events ADD COLUMN explanation TEXT")
+
 
 def insert_event(
     camera_id: str,
@@ -162,6 +170,21 @@ def query_events(
 def get_thumbnail_path(event_id: int) -> str | None:
     path = os.path.join(_THUMB_DIR, f"{event_id}.jpg")
     return path if os.path.exists(path) else None
+
+
+def get_event(event_id: int) -> dict | None:
+    with _lock, _connect() as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def set_explanation(event_id: int, text: str):
+    """Caches a generated Gemini explanation against its event, so re-expanding
+    the same row later (or a second operator opening it) doesn't re-call the
+    API — see api_server.py's /api/history/{id}/explain."""
+    with _lock, _connect() as conn:
+        conn.execute("UPDATE events SET explanation = ? WHERE id = ?", (text, event_id))
 
 
 def summary_stats(since_epoch: float | None = None) -> dict:
