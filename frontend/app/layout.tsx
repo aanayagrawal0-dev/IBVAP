@@ -5,7 +5,7 @@ import "./globals.css";
 import { AppShell } from "@/components/app-shell";
 
 export const metadata: Metadata = {
-  title: "SENTINEL-X — Border Security Hub",
+  title: "PRAHARI — Border Security Hub",
   description: "AI-driven video analytics for border security operations (IBVAP).",
 };
 
