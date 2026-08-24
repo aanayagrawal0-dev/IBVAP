@@ -38,6 +38,13 @@ dashboard — without needing new camera hardware.
 - **Operational report generation** — **Generate Report** on the Analytics page calls
   `GET /api/analytics/report.pdf`, which builds a PDF (summary counts by severity/camera, time
   range covered, and the recent event log) straight from the history database and downloads it.
+- **Gemini-powered event explanations** — click any row in the History table and it expands to
+  show a plain-language explanation from Gemini: what the event means, what's visible in the
+  captured thumbnail, and whether the assigned severity looks reasonable. Generated on demand
+  (nothing is called automatically for every logged event) and cached in the database once
+  generated, so re-expanding the same row — or a teammate opening it later — doesn't re-spend API
+  quota. Needs your own `GEMINI_API_KEY` (see "Running it" below); without one, expanding a row
+  shows a clear "not configured" message instead of failing silently.
 - **Multi-zone, multi-camera zone configuration** — draw any number of restricted-area polygons
   per camera (not just one), saved to disk (`backend/zone_config.json`) and loaded through
   `GET/PUT /api/zones/{camera_id}`. Whichever camera is currently live picks up a saved change
@@ -113,9 +120,10 @@ backend/
     zones.py             — polygon zone + debounced enter/exit events, multi-zone ZoneManager
     zone_store.py          — JSON-file persistence for per-camera zone configs
     history_store.py         — SQLite persistence for the event history log + thumbnails
-    pipeline.py                — wires the above together; run() writes to file, stream() serves live
-    api_server.py                — FastAPI bridge: MJPEG stream, alerts WebSocket, thermal toggle,
-                                    zone config CRUD, history query/export, PDF report generation
+    gemini_explainer.py        — calls Gemini to explain one history event, on demand
+    pipeline.py                  — wires the above together; run() writes to file, stream() serves live
+    api_server.py                  — FastAPI bridge: MJPEG stream, alerts WebSocket, thermal toggle,
+                                      zone config CRUD, history query/export, PDF report, Gemini explain
   tests/                          — smoke tests + synthetic demo clip generator
   sample_data/                     — demo video clip + stills
   models/                           — YOLOv8 weights
@@ -165,6 +173,52 @@ unset IBVAP_CAM04_SOURCE
 A bare integer (`"0"`, `"1"`, ...) means a webcam device index, an `rtsp://` URL means a real IP
 camera, and anything else is treated as a file path.
 
+### Gemini event explanations (optional)
+
+Only needed if you want to use the "click a History row to expand its AI analysis" feature —
+everything else works fine without it. Get a key from
+[Google AI Studio](https://aistudio.google.com/apikey) — it should look like `AIza...`, not a
+Google Cloud OAuth client ID or a service-account JSON file, which need a different setup
+entirely and won't work here.
+
+**Easiest: a `.env` file**, so you set it once instead of `export`-ing it in every new terminal:
+
+```zsh
+cd backend
+cp .env.example .env
+```
+
+Then open `.env` and paste your key in after `GEMINI_API_KEY=`. It's loaded automatically the
+next time you start the backend — `.env` is already covered by `.gitignore` conventions in this
+project's setup guidance, so make sure it's excluded in yours too before committing (see the
+`.env.example` file itself, which has no real secret in it and is safe to commit as a template
+for teammates).
+
+**Or, the manual way** — exporting it in the same terminal you launch the backend from, every
+time:
+
+```zsh
+# zsh/bash (macOS/Linux)
+export GEMINI_API_KEY="your-key-here"
+```
+
+```powershell
+# PowerShell (Windows)
+$env:GEMINI_API_KEY = "your-key-here"
+```
+
+A shell-exported value always wins over `.env` if both are set, so switching keys temporarily
+(e.g. to test a different one) doesn't require editing the file.
+
+Without a key at all, expanding a row shows a clear "GEMINI_API_KEY is not set" message instead
+of failing silently — nothing else on the page is affected. If you have a key set and still get
+an error when expanding a row, the message includes a specific hint for the failure Google
+returned (wrong key type, quota exceeded, etc.) rather than just the raw error text. The model
+used defaults to `gemini-3.6-flash`; override it with `GEMINI_MODEL` (in `.env` or exported) if
+you want a different one. Each explanation is generated once (on first expand) and cached in
+`history.db`, so it only calls the API once per event no matter how many times it's viewed
+afterward.
+
 ### Frontend
 
 ```powershell
@@ -211,13 +265,18 @@ whatever's in the database so far. On a freshly started backend with no events y
 generates, just with an empty/near-empty log; let the system run for a bit (or walk in front of
 the webcam) to see a fuller report.
 
+Click any row to expand it and get a Gemini explanation of that specific event — see "Gemini
+event explanations" above for the one-time API key setup.
+
 If you already had a `venv` set up before this update, run `pip install -r requirements.txt`
-again — the report feature added one new dependency (`fpdf2`).
+again — recent features added three new dependencies (`fpdf2` for the PDF report, `google-genai`
+for the Gemini explanations, `python-dotenv` for the `.env` file support above).
 
 ## Tech stack
 
 - **Backend**: Python, OpenCV, YOLOv8 (Ultralytics), ByteTrack (`supervision`), FastAPI, uvicorn,
-  SQLite (event history), fpdf2 (PDF report generation)
+  SQLite (event history), fpdf2 (PDF report generation), google-genai (Gemini explanations),
+  python-dotenv (`.env` config)
 - **Frontend**: Next.js 14 (App Router), TypeScript, Tailwind CSS, framer-motion, recharts
 - **Bridge**: MJPEG over HTTP for video, WebSocket for alert events
 
@@ -232,3 +291,7 @@ again — the report feature added one new dependency (`fpdf2`).
   vectors (middleware, server actions); given this runs on localhost for a demo, we judged the
   risk of a mid-hackathon major-version jump to Next 16 higher than the risk of the advisories
   themselves. Revisit before any real deployment.
+- Gemini explanations call out to Google's servers, so expanding a row takes a couple of seconds
+  the first time (cached instantly after) and needs internet access + a valid, unexhausted
+  `GEMINI_API_KEY` — offline, or over quota, it'll show an error with a Retry link rather than
+  fail silently.

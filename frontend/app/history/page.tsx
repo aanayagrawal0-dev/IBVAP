@@ -1,10 +1,29 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import { Download, SlidersHorizontal, ExternalLink, AlertTriangle } from "lucide-react";
+import { Fragment, useEffect, useState } from "react";
+import {
+  Download,
+  SlidersHorizontal,
+  ExternalLink,
+  AlertTriangle,
+  ChevronRight,
+  Sparkles,
+} from "lucide-react";
 import { SeverityBadge } from "@/components/severity-badge";
+import { cn } from "@/lib/utils";
 import type { Severity } from "@/lib/mock-data";
-import { getHistory, exportHistoryCsvUrl, thumbnailUrl, type HistoryEvent } from "@/lib/history";
+import {
+  getHistory,
+  exportHistoryCsvUrl,
+  explainEvent,
+  thumbnailUrl,
+  type HistoryEvent,
+} from "@/lib/history";
+
+type ExplainState =
+  | { status: "loading" }
+  | { status: "ready"; text: string }
+  | { status: "error"; message: string };
 
 const SEVERITY_OPTIONS: Array<Severity | "all"> = ["all", "critical", "warning", "info"];
 
@@ -25,6 +44,36 @@ export default function HistoryPage() {
   const [events, setEvents] = useState<HistoryEvent[]>([]);
   const [total, setTotal] = useState(0);
   const [status, setStatus] = useState<"loading" | "ready" | "error">("loading");
+
+  // Which row is expanded (accordion — one at a time) and, per event id,
+  // the state of its Gemini explanation. Cached client-side too so
+  // collapsing/re-expanding the same row in this session doesn't re-fetch
+  // — the backend caches it as well, but this skips the round trip.
+  const [expandedId, setExpandedId] = useState<number | null>(null);
+  const [explanations, setExplanations] = useState<Record<number, ExplainState>>({});
+
+  const fetchExplanation = (id: number) => {
+    setExplanations((prev) => ({ ...prev, [id]: { status: "loading" } }));
+    explainEvent(id)
+      .then(({ explanation }) => {
+        setExplanations((prev) => ({ ...prev, [id]: { status: "ready", text: explanation } }));
+      })
+      .catch((err: Error) => {
+        setExplanations((prev) => ({
+          ...prev,
+          [id]: { status: "error", message: err.message || "Something went wrong." },
+        }));
+      });
+  };
+
+  const toggleRow = (id: number) => {
+    if (expandedId === id) {
+      setExpandedId(null);
+      return;
+    }
+    setExpandedId(id);
+    if (!explanations[id]) fetchExplanation(id);
+  };
 
   // Re-fetch from the real backend whenever a filter or page changes —
   // nothing here is hardcoded or client-side filtered from a static array.
@@ -153,6 +202,9 @@ export default function HistoryPage() {
           <table className="w-full min-w-[720px] text-left text-xs">
             <thead className="border-b border-obsidian-border bg-obsidian-900/60 text-[10px] uppercase tracking-wide2 text-ink-dim">
               <tr>
+                <th scope="col" className="w-8 px-2 py-3">
+                  <span className="sr-only">Expand for AI analysis</span>
+                </th>
                 <th scope="col" className="px-4 py-3 font-bold">
                   Timestamp
                 </th>
@@ -176,7 +228,7 @@ export default function HistoryPage() {
             <tbody>
               {status === "loading" && (
                 <tr>
-                  <td colSpan={6} className="px-4 py-8 text-center text-ink-dim">
+                  <td colSpan={7} className="px-4 py-8 text-center text-ink-dim">
                     Loading…
                   </td>
                 </tr>
@@ -184,58 +236,123 @@ export default function HistoryPage() {
               {status === "ready" &&
                 events.map((event) => {
                   const thumb = thumbnailUrl(event);
+                  const isExpanded = expandedId === event.id;
+                  const explain = explanations[event.id];
                   return (
-                    <tr
-                      key={event.id}
-                      className="border-b border-obsidian-border last:border-0 hover:bg-obsidian-900/40"
-                    >
-                      <td className="px-4 py-3 font-mono text-ink-muted whitespace-nowrap">
-                        {event.timestamp}
-                      </td>
-                      <td className="px-4 py-3">
-                        {thumb ? (
-                          // eslint-disable-next-line @next/next/no-img-element
-                          <img
-                            src={thumb}
-                            alt={`Frame captured when ${event.eventType.toLowerCase()} fired`}
-                            className="h-8 w-12 rounded object-cover"
-                          />
-                        ) : (
-                          <div
-                            className="h-8 w-12 rounded bg-gradient-to-br from-obsidian-700 to-obsidian-950"
+                    <Fragment key={event.id}>
+                      <tr
+                        onClick={() => toggleRow(event.id)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter" || e.key === " ") {
+                            e.preventDefault();
+                            toggleRow(event.id);
+                          }
+                        }}
+                        role="button"
+                        tabIndex={0}
+                        aria-expanded={isExpanded}
+                        aria-label={`${isExpanded ? "Collapse" : "Expand"} AI analysis for ${event.eventType} on ${event.camera}`}
+                        className="cursor-pointer border-b border-obsidian-border last:border-0 hover:bg-obsidian-900/40 focus:outline-none focus:bg-obsidian-900/40"
+                      >
+                        <td className="px-2 py-3">
+                          <ChevronRight
+                            className={cn(
+                              "h-3.5 w-3.5 text-ink-dim transition-transform",
+                              isExpanded && "rotate-90 text-safety-500"
+                            )}
                             aria-hidden="true"
-                            title="No thumbnail captured for this event"
                           />
-                        )}
-                      </td>
-                      <td className="px-4 py-3 text-ink">{event.eventType}</td>
-                      <td className="px-4 py-3 font-mono text-ink-muted">{event.camera}</td>
-                      <td className="px-4 py-3">
-                        <SeverityBadge severity={event.severity} />
-                      </td>
-                      <td className="px-4 py-3">
-                        {thumb ? (
-                          <a
-                            href={thumb}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            aria-label={`Open full-size frame for event ${event.id}`}
-                            className="text-ink-dim hover:text-safety-500"
-                          >
-                            <ExternalLink className="h-3.5 w-3.5" />
-                          </a>
-                        ) : (
-                          <span className="text-ink-dim/40">
-                            <ExternalLink className="h-3.5 w-3.5" />
-                          </span>
-                        )}
-                      </td>
-                    </tr>
+                        </td>
+                        <td className="px-4 py-3 font-mono text-ink-muted whitespace-nowrap">
+                          {event.timestamp}
+                        </td>
+                        <td className="px-4 py-3">
+                          {thumb ? (
+                            // eslint-disable-next-line @next/next/no-img-element
+                            <img
+                              src={thumb}
+                              alt={`Frame captured when ${event.eventType.toLowerCase()} fired`}
+                              className="h-8 w-12 rounded object-cover"
+                            />
+                          ) : (
+                            <div
+                              className="h-8 w-12 rounded bg-gradient-to-br from-obsidian-700 to-obsidian-950"
+                              aria-hidden="true"
+                              title="No thumbnail captured for this event"
+                            />
+                          )}
+                        </td>
+                        <td className="px-4 py-3 text-ink">{event.eventType}</td>
+                        <td className="px-4 py-3 font-mono text-ink-muted">{event.camera}</td>
+                        <td className="px-4 py-3">
+                          <SeverityBadge severity={event.severity} />
+                        </td>
+                        <td className="px-4 py-3">
+                          {thumb ? (
+                            <a
+                              href={thumb}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              onClick={(e) => e.stopPropagation()}
+                              aria-label={`Open full-size frame for event ${event.id}`}
+                              className="text-ink-dim hover:text-safety-500"
+                            >
+                              <ExternalLink className="h-3.5 w-3.5" />
+                            </a>
+                          ) : (
+                            <span className="text-ink-dim/40">
+                              <ExternalLink className="h-3.5 w-3.5" />
+                            </span>
+                          )}
+                        </td>
+                      </tr>
+                      {isExpanded && (
+                        <tr className="border-b border-obsidian-border last:border-0 bg-obsidian-950/50">
+                          <td colSpan={7} className="px-6 py-4">
+                            <div className="flex items-start gap-3">
+                              <Sparkles
+                                className="mt-0.5 h-4 w-4 shrink-0 text-safety-500"
+                                aria-hidden="true"
+                              />
+                              <div className="min-w-0 flex-1">
+                                <p className="mb-1.5 text-[10px] font-bold uppercase tracking-wide2 text-ink-dim">
+                                  Gemini Analysis
+                                </p>
+                                {(!explain || explain.status === "loading") && (
+                                  <p className="text-xs text-ink-dim">Asking Gemini…</p>
+                                )}
+                                {explain?.status === "error" && (
+                                  <div className="flex flex-wrap items-center gap-2 text-xs text-critical">
+                                    <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+                                    <span>{explain.message}</span>
+                                    <button
+                                      type="button"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        fetchExplanation(event.id);
+                                      }}
+                                      className="underline hover:no-underline"
+                                    >
+                                      Retry
+                                    </button>
+                                  </div>
+                                )}
+                                {explain?.status === "ready" && (
+                                  <p className="text-xs leading-relaxed text-ink">
+                                    {explain.text}
+                                  </p>
+                                )}
+                              </div>
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                    </Fragment>
                   );
                 })}
               {status === "ready" && events.length === 0 && (
                 <tr>
-                  <td colSpan={6} className="px-4 py-8 text-center text-ink-dim">
+                  <td colSpan={7} className="px-4 py-8 text-center text-ink-dim">
                     No events match the current filters.
                   </td>
                 </tr>
