@@ -97,10 +97,15 @@ function PlaceholderScene() {
 }
 
 export function VideoPanel({
+  cameraId,
   cameraLabel,
   timestamp,
   streamUrl,
 }: {
+  /** Which camera this panel is showing, e.g. "CAM-01" — used to hit that
+   * camera's own /api/thermal/{cameraId} endpoint. Each camera has fully
+   * independent thermal state on the backend now. */
+  cameraId: string;
   cameraLabel: string;
   timestamp: string;
   /** MJPEG endpoint, e.g. http://localhost:8000/api/stream/CAM-01. Omit or
@@ -112,13 +117,21 @@ export function VideoPanel({
   const [thermalPending, setThermalPending] = useState(false);
   const showRealStream = Boolean(streamUrl) && !streamFailed;
 
+  // The parent also remounts this component on camera switch (key=
+  // {activeCamera}), but resetting here too means this still behaves
+  // correctly if VideoPanel is ever reused without that key.
+  useEffect(() => {
+    setStreamFailed(false);
+    setThermalOn(false);
+  }, [cameraId]);
+
   // Reflect the backend's current thermal state on load (and whenever the
   // stream (re)connects) so the button never lies if it was toggled from
-  // elsewhere — another tab, or a page refresh mid-session.
+  // elsewhere — another tab, another camera switch, or a page refresh.
   useEffect(() => {
     if (!showRealStream) return;
     let cancelled = false;
-    fetch(`${API_BASE}/api/thermal`)
+    fetch(`${API_BASE}/api/thermal/${encodeURIComponent(cameraId)}`)
       .then((res) => res.json())
       .then((data) => {
         if (!cancelled) setThermalOn(Boolean(data.enabled));
@@ -130,7 +143,7 @@ export function VideoPanel({
     return () => {
       cancelled = true;
     };
-  }, [showRealStream]);
+  }, [showRealStream, cameraId]);
 
   const toggleThermal = async () => {
     if (!showRealStream || thermalPending) return;
@@ -138,7 +151,7 @@ export function VideoPanel({
     setThermalPending(true);
     setThermalOn(next); // optimistic — most toggles succeed instantly
     try {
-      const res = await fetch(`${API_BASE}/api/thermal`, {
+      const res = await fetch(`${API_BASE}/api/thermal/${encodeURIComponent(cameraId)}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ enabled: next }),

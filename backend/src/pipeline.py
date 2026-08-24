@@ -30,8 +30,13 @@ class Pipeline:
         self.events = []  # collected ZoneEvent log
 
     def _draw_zones(self, frame):
+        # zone.polygon is stored as percentages (0-100) of frame width/
+        # height — convert to this frame's actual pixel coordinates rather
+        # than assuming any fixed resolution, so zones drawn against a
+        # 960x540 clip still line up correctly on a 1280x720 webcam feed.
+        h, w = frame.shape[:2]
         for zone in self.zone_manager.zones:
-            pts = np.array([(int(x), int(y)) for x, y in zone.polygon])
+            pts = np.array([(int(x / 100.0 * w), int(y / 100.0 * h)) for x, y in zone.polygon])
             overlay = frame.copy()
             cv2.fillPoly(overlay, [pts], (0, 0, 255))
             cv2.addWeighted(overlay, 0.15, frame, 0.85, 0, frame)
@@ -53,6 +58,7 @@ class Pipeline:
             detections = self.detector.detect(frame)
             tracked = self.tracker.update(detections, idx)
             detection_count += len(tracked)
+            frame_h, frame_w = frame.shape[:2]
 
             labels = []
             for i in range(len(tracked)):
@@ -63,7 +69,11 @@ class Pipeline:
 
                 x1, y1, x2, y2 = tracked.xyxy[i]
                 cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
-                for evt in self.zone_manager.update(tid, cx, cy, idx):
+                # Zones are stored as percentages — convert this frame's
+                # actual pixel centroid into that same space rather than
+                # assuming any fixed resolution.
+                cx_pct, cy_pct = cx / frame_w * 100.0, cy / frame_h * 100.0
+                for evt in self.zone_manager.update(tid, cx_pct, cy_pct, idx):
                     self.events.append(evt)
                     print(f"[ZONE EVENT] frame={evt.frame_idx} zone={evt.zone_name} "
                           f"tracker_id={evt.tracker_id} type={evt.event_type.value}")
@@ -126,6 +136,7 @@ class Pipeline:
 
                 detections = self.detector.detect(frame)
                 tracked = self.tracker.update(detections, idx)
+                frame_h, frame_w = frame.shape[:2]
 
                 labels = []
                 for i in range(len(tracked)):
@@ -137,7 +148,12 @@ class Pipeline:
 
                     x1, y1, x2, y2 = tracked.xyxy[i]
                     cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
-                    for evt in self.zone_manager.update(tid, cx, cy, idx):
+                    # Zones are stored as percentages — convert this frame's
+                    # actual pixel centroid into that same space rather than
+                    # assuming any fixed resolution (webcam frames rarely
+                    # match a recorded clip's resolution).
+                    cx_pct, cy_pct = cx / frame_w * 100.0, cy / frame_h * 100.0
+                    for evt in self.zone_manager.update(tid, cx_pct, cy_pct, idx):
                         self.events.append(evt)
                         if on_event:
                             on_event(evt, class_name)

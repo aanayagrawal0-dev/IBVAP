@@ -16,6 +16,11 @@ export default function LiveFeedPage() {
   const [alerts, setAlerts] = useState<Alert[]>(initialAlerts);
   const [now, setNow] = useState("");
   const [backendConnected, setBackendConnected] = useState(false);
+  // Empty set = "All cameras". Otherwise only alerts whose `camera` field
+  // is in this set are shown — supports single-camera, multi-camera, or
+  // all-camera filtering of the (potentially very busy, multi-camera)
+  // live alert feed.
+  const [cameraFilter, setCameraFilter] = useState<Set<string>>(new Set());
 
   // Client-only clock — avoids a server/client render mismatch from
   // formatting a live timestamp during SSR.
@@ -77,6 +82,21 @@ export default function LiveFeedPage() {
 
   const active = cameras.find((c) => c.id === activeCamera) ?? cameras[0];
 
+  const filteredAlerts =
+    cameraFilter.size === 0 ? alerts : alerts.filter((a) => cameraFilter.has(a.camera));
+
+  const toggleCameraFilter = (camId: string) => {
+    setCameraFilter((prev) => {
+      const next = new Set(prev);
+      if (next.has(camId)) {
+        next.delete(camId);
+      } else {
+        next.add(camId);
+      }
+      return next;
+    });
+  };
+
   return (
     <div className="flex h-screen flex-col">
       {/* Top bar */}
@@ -130,7 +150,13 @@ export default function LiveFeedPage() {
       <div className="grid flex-1 grid-cols-1 gap-4 overflow-hidden p-6 lg:grid-cols-[1fr_320px]">
         <div className="flex min-h-0 flex-col gap-4">
           <VideoPanel
-            cameraLabel={`CAM-01 / ${active.label}`}
+            // Remount on camera switch: each camera has its own stream,
+            // thermal state, and load/error status, so a fresh component
+            // instance is simpler and safer than manually resetting every
+            // piece of that state in place.
+            key={activeCamera}
+            cameraId={activeCamera}
+            cameraLabel={`${activeCamera} / ${active.label}`}
             timestamp={now}
             streamUrl={`${API_BASE}/api/stream/${activeCamera}`}
           />
@@ -228,8 +254,52 @@ export default function LiveFeedPage() {
                 {backendConnected ? "● backend" : "○ demo data"}
               </span>
             </div>
+            <div
+              role="group"
+              aria-label="Filter alerts by camera"
+              className="mb-3 flex flex-wrap gap-1.5"
+            >
+              <button
+                type="button"
+                onClick={() => setCameraFilter(new Set())}
+                aria-pressed={cameraFilter.size === 0}
+                className={cn(
+                  "rounded-full border px-2.5 py-1 text-[9px] font-mono font-semibold uppercase tracking-wide2 transition-colors",
+                  cameraFilter.size === 0
+                    ? "border-safety-500 bg-safety-500/15 text-safety-500"
+                    : "border-obsidian-border bg-obsidian-900 text-ink-dim hover:border-obsidian-600 hover:text-ink"
+                )}
+              >
+                All
+              </button>
+              {cameras.map((cam) => {
+                const isActive = cameraFilter.has(cam.id);
+                return (
+                  <button
+                    key={cam.id}
+                    type="button"
+                    onClick={() => toggleCameraFilter(cam.id)}
+                    aria-pressed={isActive}
+                    className={cn(
+                      "rounded-full border px-2.5 py-1 text-[9px] font-mono font-semibold uppercase tracking-wide2 transition-colors",
+                      isActive
+                        ? "border-safety-500 bg-safety-500/15 text-safety-500"
+                        : "border-obsidian-border bg-obsidian-900 text-ink-dim hover:border-obsidian-600 hover:text-ink"
+                    )}
+                  >
+                    {cam.id}
+                  </button>
+                );
+              })}
+            </div>
             <div className="overflow-y-auto pr-1">
-              <AnimatedAlertList alerts={alerts} />
+              {filteredAlerts.length > 0 ? (
+                <AnimatedAlertList alerts={filteredAlerts} />
+              ) : (
+                <p className="py-6 text-center text-[10px] font-mono uppercase tracking-wide2 text-ink-dim">
+                  No alerts for this selection
+                </p>
+              )}
             </div>
           </section>
         </div>

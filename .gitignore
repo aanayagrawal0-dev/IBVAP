@@ -1,2 +1,11 @@
-
+cat >> .gitignore << 'EOF'
+__pycache__/
+*.pyc
+venv/
+node_modules/
+.next/
+frontend/screenshots/
+EOF
 *.zip
+backend/zone_config.json
+backend/zone_config.json
