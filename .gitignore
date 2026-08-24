@@ -1,13 +1,13 @@
-cat >> .gitignore << 'EOF'
 __pycache__/
 *.pyc
 venv/
+**/venv/
 node_modules/
+**/node_modules/
 .next/
+**/ .next/
 frontend/screenshots/
-EOF
 *.zip
-backend/zone_config.json
 backend/zone_config.json
 backend/history.db
 backend/history.db-wal
