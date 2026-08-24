@@ -14,15 +14,29 @@ from src.ingestion import VideoSource
 from src.detector import Detector
 from src.tracker import Tracker
 from src.zones import ZoneManager
+from src.zero_dce import ZeroDCEEnhancer
+
+
+SKELETON_EDGES = [
+    (0, 1), (0, 2), (1, 3), (2, 4),  # facial keypoints
+    (5, 6),  # shoulders
+    (5, 7), (7, 9),  # left arm
+    (6, 8), (8, 10),  # right arm
+    (5, 11), (6, 12), (11, 12),  # torso
+    (11, 13), (13, 15),  # left leg
+    (12, 14), (14, 16),  # right leg
+]
 
 
 class Pipeline:
-    def __init__(self, source_uri, zone_manager: ZoneManager, weights="yolov8n.pt",
-                 conf_threshold=0.35, source_name="camera-1"):
+    def __init__(self, source_uri, zone_manager: ZoneManager, weights="yolo11n-pose.pt",
+                 conf_threshold=0.35, source_name="camera-1", night_vision=False):
         self.source = VideoSource(source_uri, name=source_name)
         self.detector = Detector(weights=weights, conf_threshold=conf_threshold)
         self.tracker = Tracker(frame_rate=int(self.source.fps))
         self.zone_manager = zone_manager
+        self.enhancer = ZeroDCEEnhancer()
+        self.night_vision = night_vision
 
         self.box_annotator = sv.BoxAnnotator(thickness=2)
         self.label_annotator = sv.LabelAnnotator(text_thickness=1, text_scale=0.5)
@@ -30,10 +44,6 @@ class Pipeline:
         self.events = []  # collected ZoneEvent log
 
     def _draw_zones(self, frame):
-        # zone.polygon is stored as percentages (0-100) of frame width/
-        # height — convert to this frame's actual pixel coordinates rather
-        # than assuming any fixed resolution, so zones drawn against a
-        # 960x540 clip still line up correctly on a 1280x720 webcam feed.
         h, w = frame.shape[:2]
         for zone in self.zone_manager.zones:
             pts = np.array([(int(x / 100.0 * w), int(y / 100.0 * h)) for x, y in zone.polygon])
@@ -45,7 +55,26 @@ class Pipeline:
                         0.5, (0, 0, 255), 2)
         return frame
 
-    def run(self, output_path=None, max_frames=None, print_every=25):
+    def _draw_skeletons(self, frame, kpts_xy_all, kpts_conf_all, min_conf=0.5):
+        if kpts_xy_all is None or kpts_conf_all is None:
+            return frame
+        for person_idx in range(len(kpts_xy_all)):
+            kpts_xy = kpts_xy_all[person_idx]
+            kpts_conf = kpts_conf_all[person_idx]
+
+            for p1_idx, p2_idx in SKELETON_EDGES:
+                if kpts_conf[p1_idx] > min_conf and kpts_conf[p2_idx] > min_conf:
+                    pt1 = (int(kpts_xy[p1_idx, 0]), int(kpts_xy[p1_idx, 1]))
+                    pt2 = (int(kpts_xy[p2_idx, 0]), int(kpts_xy[p2_idx, 1]))
+                    cv2.line(frame, pt1, pt2, (0, 255, 255), 2)
+
+            for k_idx in range(len(kpts_xy)):
+                if kpts_conf[k_idx] > min_conf:
+                    pt = (int(kpts_xy[k_idx, 0]), int(kpts_xy[k_idx, 1]))
+                    cv2.circle(frame, pt, 3, (0, 165, 255), -1)
+        return frame
+
+    def run(self, output_path=None, max_frames=None, print_every=25, night_vision=False):
         writer = None
         frame_count = 0
         detection_count = 0
@@ -55,10 +84,16 @@ class Pipeline:
             if max_frames and idx >= max_frames:
                 break
 
+            if night_vision or self.night_vision:
+                frame = self.enhancer.enhance(frame)
+
             detections = self.detector.detect(frame)
-            tracked = self.tracker.update(detections, idx)
+            tracked = self.tracker.update(detections, idx, frame_bgr=frame)
             detection_count += len(tracked)
             frame_h, frame_w = frame.shape[:2]
+
+            kpts_xy_all = tracked.data.get("keypoints_xy") if hasattr(tracked, "data") else None
+            kpts_conf_all = tracked.data.get("keypoints_conf") if hasattr(tracked, "data") else None
 
             labels = []
             for i in range(len(tracked)):
@@ -69,11 +104,12 @@ class Pipeline:
 
                 x1, y1, x2, y2 = tracked.xyxy[i]
                 cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
-                # Zones are stored as percentages — convert this frame's
-                # actual pixel centroid into that same space rather than
-                # assuming any fixed resolution.
                 cx_pct, cy_pct = cx / frame_w * 100.0, cy / frame_h * 100.0
-                for evt in self.zone_manager.update(tid, cx_pct, cy_pct, idx):
+
+                kpts_xy = kpts_xy_all[i] if kpts_xy_all is not None and i < len(kpts_xy_all) else None
+                kpts_conf = kpts_conf_all[i] if kpts_conf_all is not None and i < len(kpts_conf_all) else None
+
+                for evt in self.zone_manager.update(tid, cx_pct, cy_pct, idx, kpts_xy, kpts_conf):
                     self.events.append(evt)
                     print(f"[ZONE EVENT] frame={evt.frame_idx} zone={evt.zone_name} "
                           f"tracker_id={evt.tracker_id} type={evt.event_type.value}")
@@ -81,6 +117,7 @@ class Pipeline:
             annotated = frame.copy()
             annotated = self.box_annotator.annotate(annotated, tracked)
             annotated = self.label_annotator.annotate(annotated, tracked, labels=labels)
+            annotated = self._draw_skeletons(annotated, kpts_xy_all, kpts_conf_all)
             annotated = self._draw_zones(annotated)
 
             if output_path:
@@ -111,25 +148,7 @@ class Pipeline:
             "elapsed_s": elapsed,
         }
 
-    def stream(self, on_frame, on_event=None, loop=True, target_fps=None, stop_flag=None):
-        """
-        Callback-driven variant of run(), for serving a live feed instead of
-        writing one file. Calls on_frame(annotated_bgr_frame) every frame and
-        on_event(zone_event, class_name, annotated_bgr_frame) whenever a zone
-        crossing fires — the annotated frame (boxes + zone overlay already
-        drawn) is handed over too so a caller can save it as a thumbnail
-        showing exactly what triggered the alert, without redoing any of
-        the drawing itself.
-
-        loop=True replays a recorded file source indefinitely so a video file
-        behaves like a continuous live camera for demo purposes — RTSP
-        sources already behave this way via VideoSource's own reconnect
-        logic, so looping is skipped for them.
-
-        stop_flag: optional callable; stream exits when it returns True
-        (used to cleanly shut down the background thread this normally runs
-        in).
-        """
+    def stream(self, on_frame, on_event=None, loop=True, target_fps=None, stop_flag=None, night_vision_flag=None):
         frame_interval = 1.0 / target_fps if target_fps else None
 
         while True:
@@ -138,13 +157,19 @@ class Pipeline:
                     return
                 t_start = time.time()
 
+                is_night_vision = night_vision_flag() if callable(night_vision_flag) else self.night_vision
+                if is_night_vision:
+                    frame = self.enhancer.enhance(frame)
+
                 detections = self.detector.detect(frame)
-                tracked = self.tracker.update(detections, idx)
+                tracked = self.tracker.update(detections, idx, frame_bgr=frame)
                 frame_h, frame_w = frame.shape[:2]
 
+                kpts_xy_all = tracked.data.get("keypoints_xy") if hasattr(tracked, "data") else None
+                kpts_conf_all = tracked.data.get("keypoints_conf") if hasattr(tracked, "data") else None
+
                 labels = []
-                fired_this_frame = []  # (evt, class_name) — flushed once the
-                # annotated frame exists below, so thumbnails show boxes/zones.
+                fired_this_frame = []
                 for i in range(len(tracked)):
                     cls_id = int(tracked.class_id[i])
                     tid = int(tracked.tracker_id[i])
@@ -154,18 +179,19 @@ class Pipeline:
 
                     x1, y1, x2, y2 = tracked.xyxy[i]
                     cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
-                    # Zones are stored as percentages — convert this frame's
-                    # actual pixel centroid into that same space rather than
-                    # assuming any fixed resolution (webcam frames rarely
-                    # match a recorded clip's resolution).
                     cx_pct, cy_pct = cx / frame_w * 100.0, cy / frame_h * 100.0
-                    for evt in self.zone_manager.update(tid, cx_pct, cy_pct, idx):
+
+                    kpts_xy = kpts_xy_all[i] if kpts_xy_all is not None and i < len(kpts_xy_all) else None
+                    kpts_conf = kpts_conf_all[i] if kpts_conf_all is not None and i < len(kpts_conf_all) else None
+
+                    for evt in self.zone_manager.update(tid, cx_pct, cy_pct, idx, kpts_xy, kpts_conf):
                         self.events.append(evt)
                         fired_this_frame.append((evt, class_name))
 
                 annotated = frame.copy()
                 annotated = self.box_annotator.annotate(annotated, tracked)
                 annotated = self.label_annotator.annotate(annotated, tracked, labels=labels)
+                annotated = self._draw_skeletons(annotated, kpts_xy_all, kpts_conf_all)
                 annotated = self._draw_zones(annotated)
                 on_frame(annotated)
 
@@ -180,4 +206,6 @@ class Pipeline:
 
             if not loop or self.source.is_stream:
                 break
-            self.source._open()  # reopen the file to replay it
+            self.source._open()
+
+

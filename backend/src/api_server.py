@@ -60,7 +60,7 @@ def _parse_video_source(raw: str):
 
 
 # --- Config -----------------------------------------------------------
-WEIGHTS_PATH = "models/yolov8n.pt"
+WEIGHTS_PATH = "models/yolo11n-pose.pt"
 STREAM_FPS = 15
 # No fixed frame resolution here on purpose — zones are percentage-based
 # and converted against each frame's actual dimensions in pipeline.py, so
@@ -196,23 +196,38 @@ class CameraWorker:
             loop=True,
             target_fps=STREAM_FPS,
             stop_flag=lambda: self.stop_requested,
+            night_vision_flag=lambda: self.thermal_enabled,
         )
 
     def _on_frame(self, annotated_bgr):
-        frame = _apply_thermal_colormap(annotated_bgr) if self.thermal_enabled else annotated_bgr
-        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        ok, buf = cv2.imencode(".jpg", annotated_bgr, [cv2.IMWRITE_JPEG_QUALITY, 80])
         if ok:
             with self.frame_lock:
                 self.latest_jpeg = buf.tobytes()
 
     def _on_event(self, evt, class_name, annotated_bgr):
-        entered = evt.event_type == ZoneEventType.ENTERED
-        severity = "critical" if entered else "warning"
-        title = f"{class_name.upper()} {'ENTERED' if entered else 'EXITED'} ZONE"
-        description = (
-            f"Tracked object #{evt.tracker_id} ({class_name}) "
-            f"{'entered' if entered else 'exited'} '{evt.zone_name}'."
-        )
+        if evt.event_type == ZoneEventType.CLIMBING:
+            severity = "critical"
+            title = f"{class_name.upper()} CLIMBING DETECTED"
+            description = (
+                f"Tracked object #{evt.tracker_id} ({class_name}) "
+                f"detected climbing at '{evt.zone_name}'."
+            )
+        elif evt.event_type == ZoneEventType.CRAWLING:
+            severity = "critical"
+            title = f"{class_name.upper()} CRAWLING DETECTED"
+            description = (
+                f"Tracked object #{evt.tracker_id} ({class_name}) "
+                f"detected crawling/crouching at '{evt.zone_name}'."
+            )
+        else:
+            entered = evt.event_type == ZoneEventType.ENTERED
+            severity = "critical" if entered else "warning"
+            title = f"{class_name.upper()} {'ENTERED' if entered else 'EXITED'} ZONE"
+            description = (
+                f"Tracked object #{evt.tracker_id} ({class_name}) "
+                f"{'entered' if entered else 'exited'} '{evt.zone_name}'."
+            )
 
         thumbnail_jpeg = self._make_thumbnail(annotated_bgr)
 
@@ -306,18 +321,16 @@ def get_thermal(camera_id: str):
     camera = _cameras.get(camera_id)
     if camera is None:
         return _error(f"'{camera_id}' has no live source configured.", status_code=404)
-    return {"enabled": camera.thermal_enabled, "simulated": True}
+    return {"enabled": camera.thermal_enabled, "simulated": False, "mode": "Zero-DCE++"}
 
 
 @app.post("/api/thermal/{camera_id}")
 def set_thermal(camera_id: str, body: ThermalToggleRequest):
-    # NOTE: simulated=True always — this is a false-color visible-light
-    # transform for a night-time-viewing demo, not real IR/thermal sensing.
     camera = _cameras.get(camera_id)
     if camera is None:
         return _error(f"'{camera_id}' has no live source configured.", status_code=404)
     camera.thermal_enabled = body.enabled
-    return {"enabled": camera.thermal_enabled, "simulated": True}
+    return {"enabled": camera.thermal_enabled, "simulated": False, "mode": "Zero-DCE++"}
 
 
 # --- Zone config ---------------------------------------------------------
