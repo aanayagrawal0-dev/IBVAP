@@ -231,6 +231,9 @@ class CameraWorker:
 
         thumbnail_jpeg = self._make_thumbnail(annotated_bgr)
 
+        # Extract license plate if the pipeline attached one to the event
+        license_plate = getattr(evt, "license_plate", None)
+
         # The DB assigns the id (autoincrement) — reused as the live alert's
         # id too, so a WebSocket alert and its History row always match.
         event_id = history_store.insert_event(
@@ -243,6 +246,7 @@ class CameraWorker:
             title=title,
             description=description,
             thumbnail_jpeg=thumbnail_jpeg,
+            license_plate=license_plate,
         )
 
         alert = {
@@ -252,6 +256,7 @@ class CameraWorker:
             "description": description,
             "camera": self.camera_id,
             "timestamp": datetime.now().strftime("%H:%M:%S"),
+            "license_plate": license_plate,
         }
         try:
             _alert_queue.put_nowait(alert)

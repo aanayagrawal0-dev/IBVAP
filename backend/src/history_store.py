@@ -70,6 +70,8 @@ def init_db():
         existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(events)").fetchall()}
         if "explanation" not in existing_cols:
             conn.execute("ALTER TABLE events ADD COLUMN explanation TEXT")
+        if "license_plate" not in existing_cols:
+            conn.execute("ALTER TABLE events ADD COLUMN license_plate TEXT")
 
 
 def insert_event(
@@ -82,6 +84,7 @@ def insert_event(
     title: str,
     description: str,
     thumbnail_jpeg: bytes | None = None,
+    license_plate: str | None = None,
 ) -> int:
     """Persists one history row and (if given) its thumbnail JPEG. Returns
     the new row's id, which the caller uses both as the thumbnail's
@@ -97,8 +100,8 @@ def insert_event(
                 INSERT INTO events (
                     ts_epoch, ts_iso, camera_id, event_type, zone_name,
                     tracker_id, class_name, severity, title, description,
-                    has_thumbnail
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    has_thumbnail, license_plate
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     now,
@@ -112,6 +115,7 @@ def insert_event(
                     title,
                     description,
                     1 if thumbnail_jpeg else 0,
+                    license_plate,
                 ),
             )
             event_id = cur.lastrowid
@@ -157,7 +161,7 @@ def query_events(
             f"""
             SELECT id, ts_epoch, ts_iso, camera_id, event_type, zone_name,
                    tracker_id, class_name, severity, title, description,
-                   has_thumbnail
+                   has_thumbnail, license_plate
             FROM events {clause}
             ORDER BY ts_epoch DESC
             LIMIT ? OFFSET ?

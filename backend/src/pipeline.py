@@ -15,6 +15,7 @@ from src.detector import Detector
 from src.tracker import Tracker
 from src.zones import ZoneManager
 from src.zero_dce import ZeroDCEEnhancer
+from src.anpr import ANPREngine, VEHICLE_CLASS_IDS
 
 
 SKELETON_EDGES = [
@@ -37,6 +38,7 @@ class Pipeline:
         self.zone_manager = zone_manager
         self.enhancer = ZeroDCEEnhancer()
         self.night_vision = night_vision
+        self.anpr_engine = ANPREngine()
 
         self.box_annotator = sv.BoxAnnotator(thickness=2)
         self.label_annotator = sv.LabelAnnotator(text_thickness=1, text_scale=0.5)
@@ -109,10 +111,17 @@ class Pipeline:
                 kpts_xy = kpts_xy_all[i] if kpts_xy_all is not None and i < len(kpts_xy_all) else None
                 kpts_conf = kpts_conf_all[i] if kpts_conf_all is not None and i < len(kpts_conf_all) else None
 
-                for evt in self.zone_manager.update(tid, cx_pct, cy_pct, idx, kpts_xy, kpts_conf):
+                for evt in self.zone_manager.update(tid, cx_pct, cy_pct, idx, kpts_xy, kpts_conf, class_id=cls_id):
+                    # Run ANPR for vehicle targets on alert frames
+                    if cls_id in VEHICLE_CLASS_IDS:
+                        plate = self.anpr_engine.extract_plate(frame, x1, y1, x2, y2)
+                        evt.license_plate = plate
+                    else:
+                        evt.license_plate = None
                     self.events.append(evt)
+                    plate_info = f" plate={evt.license_plate}" if evt.license_plate else ""
                     print(f"[ZONE EVENT] frame={evt.frame_idx} zone={evt.zone_name} "
-                          f"tracker_id={evt.tracker_id} type={evt.event_type.value}")
+                          f"tracker_id={evt.tracker_id} type={evt.event_type.value}{plate_info}")
 
             annotated = frame.copy()
             annotated = self.box_annotator.annotate(annotated, tracked)
@@ -184,7 +193,13 @@ class Pipeline:
                     kpts_xy = kpts_xy_all[i] if kpts_xy_all is not None and i < len(kpts_xy_all) else None
                     kpts_conf = kpts_conf_all[i] if kpts_conf_all is not None and i < len(kpts_conf_all) else None
 
-                    for evt in self.zone_manager.update(tid, cx_pct, cy_pct, idx, kpts_xy, kpts_conf):
+                    for evt in self.zone_manager.update(tid, cx_pct, cy_pct, idx, kpts_xy, kpts_conf, class_id=cls_id):
+                        # Run ANPR for vehicle targets on alert frames
+                        if cls_id in VEHICLE_CLASS_IDS:
+                            plate = self.anpr_engine.extract_plate(frame, x1, y1, x2, y2)
+                            evt.license_plate = plate
+                        else:
+                            evt.license_plate = None
                         self.events.append(evt)
                         fired_this_frame.append((evt, class_name))
 
