@@ -12,8 +12,9 @@ dashboard — without needing new camera hardware.
 - **Detection & tracking** — Two-Model Top-Down Architecture: YOLOv11 (`ultralytics`) detects people/vehicles, and YOLOv11-Pose runs on cropped person bboxes;
   ByteTrack (`supervision`) assigns each one a persistent ID so it can be followed across
   frames instead of re-detected from scratch every time.
+- **Event-Driven Automatic Number Plate Recognition (ANPR)** — an event-driven `ANPREngine` powered by PaddleOCR. When a vehicle target (`car`, `motorcycle`, `bus`, `truck`) triggers a zone alert, the system crops the raw vehicle frame, applies LAB-space CLAHE contrast enhancement, and extracts alphanumeric plate text (confidence $\ge 0.40$). Extracted plates are attached directly to live WebSocket alerts and saved to `history.db`.
 - **Real AI Night Vision Enhancement** — a Zero-DCE++ deep-learning illumination engine dynamically brightens pitch-black video feeds under `torch.no_grad()` in FP16 precision. Includes an automatic high-speed LAB-space CLAHE fallback for standard CPU environments.
-- **Spatial-Temporal & Threat Behavior Rules** — geometric climbing/crawling pose checks (evaluating wrist-to-head and torso-to-knee ratios), loitering dwell timers (firing if a target remains in a zone >10s), and approach velocity vector checks.
+- **Spatial-Temporal & Threat Behavior Rules** — geometric climbing/crawling pose checks (evaluating wrist-to-head and torso-to-knee ratios on human targets, automatically bypassing vehicle classes), loitering dwell timers (firing if a target remains in a zone >10s), and approach velocity vector checks.
 - **Cross-Camera Target Re-Identification (Re-ID)** — an integrated `GlobalTargetRegistry` that uses sparse OSNet feature embeddings to match identities across disjointed camera feeds, backed by an automatic HSV color histogram fallback.
 - **Hardware Acceleration** — automated hardware detection compiling models into TensorRT (FP16) `.engine` artifacts for NVIDIA CUDA or OpenVINO execution directories for Intel CPUs, protected by thread synchronization locks.
 - **Virtual fence / zone intrusion** — a configurable polygon zone; entering/exiting it fires a
@@ -29,9 +30,9 @@ dashboard — without needing new camera hardware.
 - **Live dashboard** — a Next.js frontend ("PRAHARI") with a live annotated video feed, a
   real-time alert feed over WebSocket, a zone-drawing tool, an event history table, and an
   analytics view.
-- **Event history with real thumbnails, backed by a database** — every zone-crossing event
+- **Event history with real thumbnails & license plates, backed by a database** — every zone-crossing event
   (across every camera) is written to a SQLite database (`backend/history.db`) the instant it
-  fires, along with a JPEG thumbnail of the actual annotated frame that triggered it (boxes and
+  fires, along with any recognized license plate text and a JPEG thumbnail of the actual annotated frame that triggered it (boxes and
   zone overlay included) saved to `backend/history_thumbnails/`. The History page reads this
   live through `GET /api/history` — real pagination, and severity/date-range filters that
   actually query the database — instead of a hardcoded list. **Export Log** downloads the
@@ -79,7 +80,7 @@ Being upfront about this so it doesn't surprise anyone during a demo or a judge'
   (webcam / bundled clip / bundled clip), CAM-04 doesn't, so it shows the offline placeholder
   until you give it a source. The repo ships with several recorded demo clips in `sample_data/`, so CAM-02 and CAM-03
   can play them (as fully independent decodes) — point them at your own footage or different demo clips via their env vars for visually distinct feeds. Running several concurrent YOLO pipelines is real CPU work; if your machine struggles, disable a camera by clearing its env var rather than running all four.
-- **ANPR (license plate recognition)** and **face detection** are on the roadmap but not built.
+- **Face detection** is on the roadmap but not built.
 - The **login gate is client-side only** — credentials are hardcoded in the frontend bundle and
   the backend API itself doesn't check any token. It's a convenience gate for a demo, not
   production security.
@@ -113,17 +114,18 @@ backend/
     ingestion.py      — video source wrapper (file / webcam / RTSP), auto-reconnect
     detector.py        — YOLOv11 and YOLOv11-Pose Two-Model detector, filters to person/vehicle classes
     tracker.py          — ByteTrack wrapper, keeps trajectory history
+    anpr.py              — PaddleOCR engine with CLAHE preprocessing & regex filtering
     zero_dce.py          — Zero-DCE++ neural illumination network & CLAHE fallback
     reid.py              — TargetEmbedder & cross-camera GlobalTargetRegistry
     export_models.py      — Hardware auto-detection & TensorRT/OpenVINO exporter
     zones.py             — polygon zone + debounced enter/exit events, multi-zone ZoneManager
     zone_store.py          — JSON-file persistence for per-camera zone configs
-    history_store.py         — SQLite persistence for the event history log + thumbnails
+    history_store.py         — SQLite persistence for event history log + thumbnails + license plates
     gemini_explainer.py        — calls Gemini to explain one history event, on demand
     pipeline.py                  — wires the above together; run() writes to file, stream() serves live
     api_server.py                  — FastAPI bridge: MJPEG stream, alerts WebSocket,
                                       zone config CRUD, history query/export, PDF report, Gemini explain
-  tests/                          — smoke tests + synthetic demo clip generator
+  tests/                          — smoke tests, ANPR tests + synthetic demo clip generator
   sample_data/                     — bundled demo video clips (drone, fence climbing, etc.)
   models/                           — YOLOv11 and YOLOv11-Pose weights / TensorRT engines
   zone_config.json                   — saved zones per camera (created on first run)
@@ -254,7 +256,7 @@ the backend.
 
 Every zone-crossing event, from every running camera, is logged automatically — nothing to turn
 on. Open **History** to see it: a real, paginated table backed by `backend/history.db`, complete
-with a thumbnail of the actual frame that triggered each event. **Date Range** and **Severity**
+with a thumbnail of the actual frame that triggered each event and any extracted license plate numbers. **Date Range** and **Severity**
 filter by re-querying the database (not filtering an in-page list), and **Export Log** downloads
 whatever's currently filtered as a CSV.
 
@@ -268,12 +270,11 @@ Click any row to expand it and get a Gemini explanation of that specific event �
 event explanations" above for the one-time API key setup.
 
 If you already had a `venv` set up before this update, run `pip install -r requirements.txt`
-again — recent features added three new dependencies (`fpdf2` for the PDF report, `google-genai`
-for the Gemini explanations, `python-dotenv` for the `.env` file support above).
+again — recent features added dependencies (`paddlepaddle`, `paddleocr`, `fpdf2`, `google-genai`, `python-dotenv`).
 
 ## Tech stack
 
-- **Backend**: Python, OpenCV, YOLOv11 and YOLOv11-Pose (Ultralytics), ByteTrack (`supervision`), FastAPI, uvicorn,
+- **Backend**: Python, OpenCV, YOLOv11 and YOLOv11-Pose (Ultralytics), PaddleOCR & PaddlePaddle (ANPR), ByteTrack (`supervision`), FastAPI, uvicorn,
   SQLite (event history), fpdf2 (PDF report generation), google-genai (Gemini explanations),
   python-dotenv (`.env` config)
 - **Frontend**: Next.js 14 (App Router), TypeScript, Tailwind CSS, framer-motion, recharts
@@ -290,3 +291,4 @@ for the Gemini explanations, `python-dotenv` for the `.env` file support above).
   the first time (cached instantly after) and needs internet access + a valid, unexhausted
   `GEMINI_API_KEY` — offline, or over quota, it'll show an error with a Retry link rather than
   fail silently.
+- PaddleOCR is designed to fall back gracefully if missing; if `paddleocr` is not installed in your Python environment, the system runs at full speed with ANPR disabled.
