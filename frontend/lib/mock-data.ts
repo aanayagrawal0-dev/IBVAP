@@ -9,18 +9,9 @@ export interface Alert {
   timestamp: string;
 }
 
-export interface Camera {
-  id: string;
-  label: string;
-  status: "nominal" | "alert" | "offline";
-}
-
-export const cameras: Camera[] = [
-  { id: "CAM-01", label: "OUTPOST DUSK", status: "nominal" },
-  { id: "CAM-02", label: "PASS", status: "nominal" },
-  { id: "CAM-03", label: "FENCE LINE", status: "alert" },
-  { id: "CAM-04", label: "GATE", status: "nominal" },
-];
+// The camera list is no longer hardcoded here — the Camera Registry
+// (backend camera_store + /api/cameras) is the source of truth, surfaced
+// through lib/cameras.ts. See the Live / Zone-config / History pages.
 
 export const initialAlerts: Alert[] = [
   {

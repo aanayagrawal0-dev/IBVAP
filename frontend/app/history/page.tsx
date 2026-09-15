@@ -10,7 +10,8 @@ import {
   X,
 } from "lucide-react";
 import { SeverityBadge } from "@/components/severity-badge";
-import { cameras, type Severity } from "@/lib/mock-data";
+import { type Severity } from "@/lib/mock-data";
+import { fetchCameraOptions, FALLBACK_CAMERAS, type CameraOption } from "@/lib/cameras";
 import {
   getHistory,
   exportHistoryCsvUrl,
@@ -40,6 +41,18 @@ export default function HistoryPage() {
   const [dateRange, setDateRange] = useState("Last 24 Hours");
   const [cameraFilter, setCameraFilter] = useState("all");
   const [page, setPage] = useState(0);
+  const [cameras, setCameras] = useState<CameraOption[]>(FALLBACK_CAMERAS);
+
+  // Registry drives the camera filter list.
+  useEffect(() => {
+    let cancelled = false;
+    fetchCameraOptions().then((cams) => {
+      if (!cancelled && cams.length) setCameras(cams);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const [events, setEvents] = useState<HistoryEvent[]>([]);
   const [total, setTotal] = useState(0);

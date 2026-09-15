@@ -47,16 +47,7 @@ load_dotenv()
 
 from src.pipeline import Pipeline
 from src.zones import Zone, ZoneManager, ZoneEventType
-from src import history_store, zone_store
-
-
-def _parse_video_source(raw: str):
-    """A bare integer string ("0", "1", ...) means a local webcam device
-    index. Anything else — an RTSP URL or a file path — is passed through
-    as-is to cv2.VideoCapture. An empty/unset string means "this camera has
-    no live source" — it's simply not started (see CAMERA_SOURCES below)."""
-    raw = raw.strip()
-    return int(raw) if raw.lstrip("-").isdigit() else raw
+from src import history_store, zone_store, camera_store, watchlist
 
 
 # --- Config -----------------------------------------------------------
@@ -66,32 +57,48 @@ STREAM_FPS = 15
 # and converted against each frame's actual dimensions in pipeline.py, so
 # different cameras can run at whatever resolution their source provides.
 
-# One entry per camera the frontend knows about (see frontend/lib/mock-data
-# .ts). Each is independently overridable via its own env var — an empty
-# value means that camera simply isn't run (GET /api/stream/{id} 404s and
-# the frontend falls back to its offline placeholder for it).
+# The Camera Registry (camera_store) is now the source of truth for which
+# cameras exist and how to reach them — see the /api/cameras endpoints
+# below. These entries only SEED an empty registry on first boot; after
+# that an operator's runtime edits win and are never overwritten.
 #
-#   IBVAP_CAM01_SOURCE=0                        laptop/USB webcam
-#   IBVAP_CAM02_SOURCE=rtsp://192.168.1.50/...  a real IP camera
-#   IBVAP_CAM03_SOURCE=sample_data/x.mp4        a recorded clip
-#   IBVAP_CAM04_SOURCE=                         (default) not run
+# A camera's source_spec is whatever ingestion.open_source() understands:
+#   "0"                          laptop/USB webcam (device index)
+#   "rtsp://192.168.1.50/..."    a real IP camera
+#   "onvif://user:pass@host"     an ONVIF camera (handshake -> RTSP)
+#   "http://host/mjpeg"          an HTTP MJPEG endpoint
+#   "sample_data/x.mp4"          a recorded clip
+#   ""                           no live source yet (not started)
 #
-# CAM-01 defaults to your webcam so there's always one genuinely live feed
-# out of the box. CAM-02/03 default to the bundled demo clip — the repo
-# only ships one recorded clip, so both play it independently (separate
-# VideoCapture instances, so they *will* drift out of sync with each
-# other — they're not mirrors of one shared decode). Point them at your
-# own footage via the env vars above for visually distinct feeds.
-_DEFAULT_SOURCES = {
-    "CAM-01": "0",
-    "CAM-02": "sample_data/synthetic_test_clip.mp4",
-    "CAM-03": "sample_data/synthetic_test_clip.mp4",
-    "CAM-04": "",
-}
-CAMERA_SOURCES = {
-    cam_id: os.environ.get(f"IBVAP_{cam_id.replace('-', '')}_SOURCE", default)
-    for cam_id, default in _DEFAULT_SOURCES.items()
-}
+# GIS coordinates are seeded around Gujarat so the /registry map has real
+# points to plot out of the box. Each source is still overridable on first
+# boot via its IBVAP_CAM0x_SOURCE env var, preserving existing .env setups.
+def _seed_source(cam_id: str, default: str) -> str:
+    return os.environ.get(f"IBVAP_{cam_id.replace('-', '')}_SOURCE", default)
+
+
+_DEFAULT_CAMERAS = [
+    {
+        "id": "CAM-01", "name": "Webcam — Ashram Road", "department": "Traffic Police",
+        "lat": 23.0300, "lon": 72.5714, "ownership": "GSP", "storage_details": "Edge NVR, 15-day retention",
+        "source_spec": _seed_source("CAM-01", "0"),
+    },
+    {
+        "id": "CAM-02", "name": "Gate Camera — Gandhinagar Secretariat", "department": "Home Guard",
+        "lat": 23.2156, "lon": 72.6369, "ownership": "GSP", "storage_details": "Central VMS, 30-day retention",
+        "source_spec": _seed_source("CAM-02", "sample_data/synthetic_test_clip.mp4"),
+    },
+    {
+        "id": "CAM-03", "name": "Junction Camera — Surat Ring Road", "department": "Traffic Police",
+        "lat": 21.1702, "lon": 72.8311, "ownership": "Municipal Corp", "storage_details": "Central VMS, 30-day retention",
+        "source_spec": _seed_source("CAM-03", "sample_data/synthetic_test_clip.mp4"),
+    },
+    {
+        "id": "CAM-04", "name": "Perimeter Camera — Vadodara Depot", "department": "Reserve Police",
+        "lat": 22.3072, "lon": 73.1812, "ownership": "GSP", "storage_details": "Not yet provisioned",
+        "source_spec": _seed_source("CAM-04", ""),
+    },
+]
 
 # Used the first time a camera has no saved zone config yet (see
 # zone_store.py / the /api/zones endpoints below). Stored/edited from the
@@ -144,6 +151,49 @@ _alert_queue: "queue.Queue[dict]" = queue.Queue(maxsize=200)
 THUMBNAIL_MAX_WIDTH = 320
 
 
+def _emit_watchlist_alert(camera_id, plate, entry, tracker_id, class_name, thumbnail_jpeg=None):
+    """Persist a watchlist_match event and broadcast its alert — the single
+    shared path used by both the live pipeline (CameraWorker._on_watchlist_match)
+    and the /api/watchlist/simulate demo hook. Reuses the same DB +
+    WebSocket transport as zone alerts; only the trigger/type differs."""
+    event_ts = time.time()
+    severity = entry.get("severity") or "critical"
+    label = entry.get("label") or "watchlisted vehicle"
+    title = f"WATCHLIST MATCH — {plate}"
+    description = (
+        f"Plate {plate} ({label}) detected on {camera_id} "
+        f"— tracked object #{tracker_id} ({class_name})."
+    )
+    event_id = history_store.insert_event(
+        camera_id=camera_id,
+        event_type="watchlist_match",
+        zone_name=label,  # reuse the column to carry the watchlist reason
+        tracker_id=tracker_id,
+        class_name=class_name,
+        severity=severity,
+        title=title,
+        description=description,
+        thumbnail_jpeg=thumbnail_jpeg,
+        license_plate=plate,
+        event_ts=event_ts,
+    )
+    alert = {
+        "id": f"evt-{event_id}",
+        "severity": severity,
+        "title": title,
+        "description": description,
+        "camera": camera_id,
+        "timestamp": datetime.fromtimestamp(event_ts).strftime("%H:%M:%S"),
+        "license_plate": plate,
+        "type": "watchlist_match",
+    }
+    try:
+        _alert_queue.put_nowait(alert)
+    except queue.Full:
+        pass
+    return event_id
+
+
 class CameraWorker:
     """Owns one camera's entire live pipeline: its own video capture,
     detector, tracker, zone manager, thermal toggle, and background thread.
@@ -193,6 +243,7 @@ class CameraWorker:
         pipeline.stream(
             on_frame=self._on_frame,
             on_event=self._on_event,
+            on_watchlist=self._on_watchlist_match,
             loop=True,
             target_fps=STREAM_FPS,
             stop_flag=lambda: self.stop_requested,
@@ -206,6 +257,10 @@ class CameraWorker:
                 self.latest_jpeg = buf.tobytes()
 
     def _on_event(self, evt, class_name, annotated_bgr):
+        # One authoritative timestamp for this event, read ONCE and shared by
+        # the DB row and the live alert below, so the audit record and the
+        # broadcast can't disagree about when the event happened.
+        event_ts = time.time()
         if evt.event_type == ZoneEventType.CLIMBING:
             severity = "critical"
             title = f"{class_name.upper()} CLIMBING DETECTED"
@@ -247,6 +302,7 @@ class CameraWorker:
             description=description,
             thumbnail_jpeg=thumbnail_jpeg,
             license_plate=license_plate,
+            event_ts=event_ts,
         )
 
         alert = {
@@ -255,13 +311,26 @@ class CameraWorker:
             "title": title,
             "description": description,
             "camera": self.camera_id,
-            "timestamp": datetime.now().strftime("%H:%M:%S"),
+            "timestamp": datetime.fromtimestamp(event_ts).strftime("%H:%M:%S"),
             "license_plate": license_plate,
         }
         try:
             _alert_queue.put_nowait(alert)
         except queue.Full:
             pass  # drop rather than block the CV thread if nobody's draining it
+
+    def _on_watchlist_match(self, match, annotated_bgr):
+        """Fires when a plate read off this camera's feed matches an active
+        watchlist entry. Delegates to the shared emitter so the live-pipeline
+        path and the /api/watchlist/simulate demo hook stay identical."""
+        return _emit_watchlist_alert(
+            camera_id=self.camera_id,
+            plate=match["plate"],
+            entry=match["entry"],
+            tracker_id=match["tracker_id"],
+            class_name=match["class_name"],
+            thumbnail_jpeg=self._make_thumbnail(annotated_bgr),
+        )
 
     @staticmethod
     def _make_thumbnail(annotated_bgr) -> bytes | None:
@@ -275,14 +344,48 @@ class CameraWorker:
         return buf.tobytes() if ok else None
 
 
-# Only cameras with a non-empty configured source actually run. The rest
-# stay fully configurable via the zone-config UI (their zones are saved
-# and waiting) but simply aren't started — see CAMERA_SOURCES above.
-_cameras: dict[str, CameraWorker] = {
-    cam_id: CameraWorker(cam_id, _parse_video_source(raw))
-    for cam_id, raw in CAMERA_SOURCES.items()
-    if raw.strip() != ""
-}
+# The live CameraWorker for each camera that's currently streaming, keyed by
+# camera id. Populated from the registry on startup and mutated at RUNTIME by
+# the /api/cameras endpoints (add / edit / remove) with no server restart.
+# _cameras_lock guards structural mutations; reads use dict.get (GIL-atomic).
+_cameras: dict[str, CameraWorker] = {}
+_cameras_lock = threading.Lock()
+
+
+def _runnable_source(cam: dict):
+    """The source spec to hand a worker, or None if this camera shouldn't run
+    (disabled, or no source configured yet)."""
+    if not cam.get("enabled", True):
+        return None
+    spec = cam.get("source_spec")
+    if spec is None or (isinstance(spec, str) and spec.strip() == ""):
+        return None
+    return spec.strip() if isinstance(spec, str) else spec
+
+
+def _start_worker(cam: dict) -> bool:
+    """Start (or restart) the CameraWorker for a registry row. Returns True if
+    a worker is now running for it. Caller must hold _cameras_lock."""
+    camera_id = cam["id"]
+    existing = _cameras.pop(camera_id, None)
+    if existing is not None:
+        existing.stop()
+
+    source = _runnable_source(cam)
+    if source is None:
+        return False
+
+    worker = CameraWorker(camera_id, source)
+    worker.start()
+    _cameras[camera_id] = worker
+    return True
+
+
+def _stop_worker(camera_id: str):
+    """Stop and forget a camera's worker if it has one. Caller holds _cameras_lock."""
+    worker = _cameras.pop(camera_id, None)
+    if worker is not None:
+        worker.stop()
 
 
 # --- FastAPI app --------------------------------------------------------
@@ -299,14 +402,23 @@ app.add_middleware(
 @app.on_event("startup")
 def _startup():
     history_store.init_db()
-    for camera in _cameras.values():
-        camera.start()
+    camera_store.init_db()
+    watchlist.init_db()
+    camera_store.seed_defaults(_DEFAULT_CAMERAS)
+    with _cameras_lock:
+        for cam in camera_store.list_cameras():
+            try:
+                _start_worker(cam)
+            except Exception as exc:
+                print(f"[{cam['id']}] failed to start on boot: {exc}")
 
 
 @app.on_event("shutdown")
 def _shutdown():
-    for camera in _cameras.values():
-        camera.stop()
+    with _cameras_lock:
+        for camera in list(_cameras.values()):
+            camera.stop()
+        _cameras.clear()
 
 
 @app.get("/api/health")
@@ -315,6 +427,256 @@ def health():
         "status": "ok",
         "cameras": {cam_id: cam.is_alive() for cam_id, cam in _cameras.items()},
     }
+
+
+# --- Camera Registry (Model 1: source of truth for onboarded cameras) -------
+# CRUD over camera_store plus CSV bulk import/export. Adding/editing/removing a
+# camera here also starts/stops its live CameraWorker so a change takes effect
+# WITHOUT a server restart — that's the Phase 2 acceptance requirement.
+
+
+class CameraIn(BaseModel):
+    id: str | None = None
+    name: str | None = None
+    department: str | None = None
+    lat: float | None = None
+    lon: float | None = None
+    ownership: str | None = None
+    source_spec: str | None = None
+    status: str | None = None
+    storage_details: str | None = None
+    enabled: bool | None = None
+
+
+class CsvImport(BaseModel):
+    csv: str
+
+
+def _next_camera_id() -> str:
+    existing = {c["id"] for c in camera_store.list_cameras()}
+    n = 1
+    while f"CAM-{n:02d}" in existing:
+        n += 1
+    return f"CAM-{n:02d}"
+
+
+def _serialize_camera(cam: dict) -> dict:
+    """Registry row + live runtime status, merged for the frontend."""
+    worker = _cameras.get(cam["id"])
+    streaming = bool(worker and worker.is_alive())
+    spec = cam.get("source_spec")
+    has_source = bool(spec.strip()) if isinstance(spec, str) else bool(spec)
+    if not cam.get("enabled", True):
+        connectivity = "disabled"
+    elif not has_source:
+        connectivity = "no-source"
+    elif streaming:
+        connectivity = "online"
+    else:
+        connectivity = "offline"
+    return {**cam, "streaming": streaming, "connectivity": connectivity}
+
+
+def _to_float(v):
+    try:
+        return float(v) if v not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_bool(v, default=True):
+    if v is None or v == "":
+        return default
+    return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+@app.get("/api/cameras")
+def list_cameras():
+    return {"cameras": [_serialize_camera(c) for c in camera_store.list_cameras()]}
+
+
+@app.get("/api/cameras/export.csv")
+def export_cameras_csv():
+    # Declared BEFORE the /api/cameras/{camera_id} route so "export.csv" is
+    # matched as this static path, not captured as a camera id.
+    cols = ["id", "name", "department", "lat", "lon", "camera_type",
+            "ownership", "source_spec", "status", "storage_details", "enabled"]
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=cols, extrasaction="ignore")
+    writer.writeheader()
+    for cam in camera_store.list_cameras():
+        writer.writerow(cam)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return Response(
+        content=buf.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="ibvap_cameras_{stamp}.csv"'},
+    )
+
+
+@app.get("/api/cameras/{camera_id}")
+def get_camera(camera_id: str):
+    cam = camera_store.get_camera(camera_id)
+    if cam is None:
+        return _error(f"No camera '{camera_id}'.", status_code=404)
+    return _serialize_camera(cam)
+
+
+@app.post("/api/cameras")
+def create_camera(body: CameraIn):
+    camera_id = (body.id or "").strip() or _next_camera_id()
+    fields = body.model_dump(exclude_none=True)
+    fields.pop("id", None)
+    try:
+        cam = camera_store.add_camera(camera_id, fields)
+    except ValueError as exc:
+        return _error(str(exc), status_code=409)  # id already exists
+    with _cameras_lock:
+        _start_worker(cam)
+    return JSONResponse(status_code=201, content=_serialize_camera(cam))
+
+
+@app.put("/api/cameras/{camera_id}")
+def update_camera(camera_id: str, body: CameraIn):
+    before = camera_store.get_camera(camera_id)
+    if before is None:
+        return _error(f"No camera '{camera_id}'.", status_code=404)
+
+    fields = body.model_dump(exclude_none=True)
+    fields.pop("id", None)
+    cam = camera_store.update_camera(camera_id, fields)
+
+    # Restart the worker only when something that affects streaming changed.
+    source_changed = "source_spec" in fields and (fields.get("source_spec") or "") != (before.get("source_spec") or "")
+    enabled_changed = "enabled" in fields and bool(fields["enabled"]) != bool(before.get("enabled"))
+    if source_changed or enabled_changed:
+        with _cameras_lock:
+            _start_worker(cam)  # stops any existing, then (re)starts if runnable
+    return _serialize_camera(cam)
+
+
+@app.delete("/api/cameras/{camera_id}")
+def delete_camera(camera_id: str):
+    with _cameras_lock:
+        _stop_worker(camera_id)
+    if not camera_store.delete_camera(camera_id):
+        return _error(f"No camera '{camera_id}'.", status_code=404)
+    return {"deleted": camera_id}
+
+
+@app.post("/api/cameras/import")
+def import_cameras(body: CsvImport):
+    """Bulk-onboard cameras from CSV text. Columns (header row required):
+    id,name,department,lat,lon,source_spec,ownership,storage_details,enabled.
+    id is optional (auto-assigned); duplicate ids are skipped, not errored."""
+    reader = csv.DictReader(io.StringIO(body.csv))
+    added, skipped, errors = [], [], []
+    to_start = []
+    for line_no, row in enumerate(reader, start=2):  # header is line 1
+        cam_id = (row.get("id") or "").strip() or _next_camera_id()
+        fields = {
+            "name": row.get("name"),
+            "department": row.get("department"),
+            "lat": _to_float(row.get("lat")),
+            "lon": _to_float(row.get("lon")),
+            "ownership": row.get("ownership"),
+            "source_spec": row.get("source_spec"),
+            "storage_details": row.get("storage_details"),
+            "enabled": _to_bool(row.get("enabled"), default=True),
+        }
+        try:
+            cam = camera_store.add_camera(cam_id, {k: v for k, v in fields.items() if v is not None})
+            added.append(cam["id"])
+            to_start.append(cam)
+        except ValueError:
+            skipped.append(cam_id)
+        except Exception as exc:  # malformed row shouldn't abort the whole import
+            errors.append({"line": line_no, "error": str(exc)})
+
+    with _cameras_lock:
+        for cam in to_start:
+            try:
+                _start_worker(cam)
+            except Exception as exc:
+                errors.append({"camera": cam["id"], "error": str(exc)})
+
+    return {"added": added, "skipped": skipped, "errors": errors}
+
+
+# --- Watchlist (Phase 3: continuous plate cross-referencing + alerting) -----
+
+
+class WatchlistIn(BaseModel):
+    plate: str
+    label: str | None = None
+    severity: str | None = None
+
+
+class WatchlistActiveIn(BaseModel):
+    active: bool
+
+
+class SimulateSightingIn(BaseModel):
+    camera_id: str
+    plate: str
+
+
+@app.get("/api/watchlist")
+def get_watchlist():
+    return {"entries": watchlist.list_entries()}
+
+
+@app.post("/api/watchlist")
+def add_watchlist_entry(body: WatchlistIn):
+    try:
+        entry = watchlist.add_plate(body.plate, label=body.label, severity=body.severity or "critical")
+    except ValueError as exc:
+        return _error(str(exc), status_code=409)
+    return JSONResponse(status_code=201, content=entry)
+
+
+@app.put("/api/watchlist/{entry_id}/active")
+def set_watchlist_active(entry_id: int, body: WatchlistActiveIn):
+    entry = watchlist.set_active(entry_id, body.active)
+    if entry is None:
+        return _error(f"No watchlist entry {entry_id}.", status_code=404)
+    return entry
+
+
+@app.delete("/api/watchlist/{entry_id}")
+def delete_watchlist_entry(entry_id: int):
+    if not watchlist.remove(entry_id):
+        return _error(f"No watchlist entry {entry_id}.", status_code=404)
+    return {"deleted": entry_id}
+
+
+@app.post("/api/watchlist/simulate")
+def simulate_watchlist_sighting(body: SimulateSightingIn):
+    """Demo/test hook: pretend `camera_id`'s ANPR just read `plate`, running
+    the REAL watchlist check + alert path — so a match can be demonstrated
+    without a physical plate or a live OCR model installed. On a match it
+    emits the same watchlist_match event + WebSocket alert the live pipeline
+    would (using the camera's latest frame as the thumbnail if it's live)."""
+    entry = watchlist.check_plate(body.plate)
+    norm = watchlist.normalize_plate(body.plate)
+    if entry is None:
+        return {"matched": False, "plate": norm}
+
+    worker = _cameras.get(body.camera_id)
+    thumbnail = None
+    if worker is not None:
+        with worker.frame_lock:
+            thumbnail = worker.latest_jpeg  # already a JPEG; reuse as-is
+
+    event_id = _emit_watchlist_alert(
+        camera_id=body.camera_id,
+        plate=norm,
+        entry=entry,
+        tracker_id=0,
+        class_name="car",
+        thumbnail_jpeg=thumbnail,
+    )
+    return {"matched": True, "plate": norm, "event_id": event_id, "severity": entry.get("severity")}
 
 
 class ThermalToggleRequest(BaseModel):
