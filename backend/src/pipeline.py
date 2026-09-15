@@ -10,12 +10,13 @@ import cv2
 import numpy as np
 import supervision as sv
 
-from src.ingestion import VideoSource
+from src.ingestion import open_source
 from src.detector import Detector
 from src.tracker import Tracker
 from src.zones import ZoneManager
 from src.zero_dce import ZeroDCEEnhancer
 from src.anpr import ANPREngine, VEHICLE_CLASS_IDS
+from src import watchlist
 
 
 SKELETON_EDGES = [
@@ -32,7 +33,10 @@ SKELETON_EDGES = [
 class Pipeline:
     def __init__(self, source_uri, zone_manager: ZoneManager, weights="yolo11n-pose.pt",
                  conf_threshold=0.35, source_name="camera-1", night_vision=False):
-        self.source = VideoSource(source_uri, name=source_name)
+        # open_source dispatches on the spec (webcam / RTSP / file / ONVIF /
+        # HTTP-MJPEG) and returns an adapter satisfying the same frame
+        # contract, so everything below is unchanged regardless of source.
+        self.source = open_source(source_uri, name=source_name)
         self.detector = Detector(weights=weights, conf_threshold=conf_threshold)
         self.tracker = Tracker(frame_rate=int(self.source.fps))
         self.zone_manager = zone_manager
@@ -44,6 +48,16 @@ class Pipeline:
         self.label_annotator = sv.LabelAnnotator(text_thickness=1, text_scale=0.5)
 
         self.events = []  # collected ZoneEvent log
+
+        # ANPR/watchlist state. OCR is expensive, so we read each vehicle
+        # tracker's plate at most once every `anpr_interval` frames and cache
+        # the result — reused for zone-event tagging AND checked against the
+        # watchlist on every fresh read. `_alerted_watchlist` de-dupes so one
+        # watchlisted vehicle doesn't fire an alert on every subsequent frame.
+        self.anpr_interval = 15
+        self._plate_cache: dict[int, str] = {}
+        self._plate_read_frame: dict[int, int] = {}
+        self._alerted_watchlist: set[tuple[int, str]] = set()
 
     def _draw_zones(self, frame):
         h, w = frame.shape[:2]
@@ -75,6 +89,22 @@ class Pipeline:
                     pt = (int(kpts_xy[k_idx, 0]), int(kpts_xy[k_idx, 1]))
                     cv2.circle(frame, pt, 3, (0, 165, 255), -1)
         return frame
+
+    def _maybe_read_plate(self, tid, idx, frame, x1, y1, x2, y2):
+        """Throttled per-vehicle ANPR: attempt OCR at most once every
+        `anpr_interval` frames for a given tracker, caching the last
+        successful read so downstream (zone tagging, watchlist, route
+        reconstruction) always has the freshest known plate without paying
+        for OCR every frame. Returns the plate string or None."""
+        last = self._plate_read_frame.get(tid)
+        if last is not None and (idx - last) < self.anpr_interval:
+            return self._plate_cache.get(tid)
+        self._plate_read_frame[tid] = idx
+        plate = self.anpr_engine.extract_plate(frame, x1, y1, x2, y2)
+        if plate:
+            self._plate_cache[tid] = plate
+            return plate
+        return self._plate_cache.get(tid)
 
     def run(self, output_path=None, max_frames=None, print_every=25, night_vision=False):
         writer = None
@@ -157,7 +187,8 @@ class Pipeline:
             "elapsed_s": elapsed,
         }
 
-    def stream(self, on_frame, on_event=None, loop=True, target_fps=None, stop_flag=None, night_vision_flag=None):
+    def stream(self, on_frame, on_event=None, loop=True, target_fps=None, stop_flag=None,
+               night_vision_flag=None, on_watchlist=None):
         frame_interval = 1.0 / target_fps if target_fps else None
 
         while True:
@@ -179,6 +210,7 @@ class Pipeline:
 
                 labels = []
                 fired_this_frame = []
+                watchlist_hits = []
                 for i in range(len(tracked)):
                     cls_id = int(tracked.class_id[i])
                     tid = int(tracked.tracker_id[i])
@@ -190,16 +222,27 @@ class Pipeline:
                     cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
                     cx_pct, cy_pct = cx / frame_w * 100.0, cy / frame_h * 100.0
 
+                    # Continuous, throttled ANPR on vehicles — independent of
+                    # zone events, so a watchlisted plate is caught simply by
+                    # being seen. Each fresh read is cross-referenced against
+                    # the watchlist immediately; the per-(tracker, plate)
+                    # de-dupe keeps one vehicle from re-alerting every frame.
+                    plate = None
+                    if cls_id in VEHICLE_CLASS_IDS:
+                        plate = self._maybe_read_plate(tid, idx, frame, x1, y1, x2, y2)
+                        if plate:
+                            entry = watchlist.check_plate(plate)
+                            if entry and (tid, plate) not in self._alerted_watchlist:
+                                self._alerted_watchlist.add((tid, plate))
+                                watchlist_hits.append((plate, entry, tid, class_name))
+
                     kpts_xy = kpts_xy_all[i] if kpts_xy_all is not None and i < len(kpts_xy_all) else None
                     kpts_conf = kpts_conf_all[i] if kpts_conf_all is not None and i < len(kpts_conf_all) else None
 
                     for evt in self.zone_manager.update(tid, cx_pct, cy_pct, idx, kpts_xy, kpts_conf, class_id=cls_id):
-                        # Run ANPR for vehicle targets on alert frames
-                        if cls_id in VEHICLE_CLASS_IDS:
-                            plate = self.anpr_engine.extract_plate(frame, x1, y1, x2, y2)
-                            evt.license_plate = plate
-                        else:
-                            evt.license_plate = None
+                        # Tag the event with this vehicle's most recent plate
+                        # read (already OCR'd above — don't re-run OCR here).
+                        evt.license_plate = plate if cls_id in VEHICLE_CLASS_IDS else None
                         self.events.append(evt)
                         fired_this_frame.append((evt, class_name))
 
@@ -213,6 +256,13 @@ class Pipeline:
                 if on_event:
                     for evt, class_name in fired_this_frame:
                         on_event(evt, class_name, annotated)
+
+                if on_watchlist:
+                    for plate, entry, tid, cname in watchlist_hits:
+                        on_watchlist(
+                            {"plate": plate, "entry": entry, "tracker_id": tid, "class_name": cname},
+                            annotated,
+                        )
 
                 if frame_interval:
                     elapsed = time.time() - t_start

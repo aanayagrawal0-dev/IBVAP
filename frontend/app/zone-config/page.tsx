@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Plus, Save, X, Trash2, AlertTriangle, CheckCircle2 } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { cameras } from "@/lib/mock-data";
+import { fetchCameraOptions, FALLBACK_CAMERAS, type CameraOption } from "@/lib/cameras";
 import { getZones, saveZones, type Point, type ZoneDef } from "@/lib/zones";
 
 const ZONE_COLORS = [
@@ -32,7 +32,8 @@ type LoadState = "loading" | "loaded" | "offline";
 type SaveState = { kind: "idle" } | { kind: "saving" } | { kind: "ok"; hotReloaded: boolean } | { kind: "error"; message: string };
 
 export default function ZoneConfigPage() {
-  const [cameraId, setCameraId] = useState(cameras[0].id);
+  const [cameras, setCameras] = useState<CameraOption[]>(FALLBACK_CAMERAS);
+  const [cameraId, setCameraId] = useState(FALLBACK_CAMERAS[0].id);
   const [zones, setZones] = useState<ZoneDef[]>([]);
   const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
   const [adding, setAdding] = useState(false);
@@ -40,6 +41,19 @@ export default function ZoneConfigPage() {
   const [loadState, setLoadState] = useState<LoadState>("loading");
   const [saveState, setSaveState] = useState<SaveState>({ kind: "idle" });
   const containerRef = useRef<HTMLDivElement>(null);
+
+  // Registry drives the camera list — fetch it on mount.
+  useEffect(() => {
+    let cancelled = false;
+    fetchCameraOptions().then((cams) => {
+      if (cancelled || cams.length === 0) return;
+      setCameras(cams);
+      setCameraId((prev) => (cams.some((c) => c.id === prev) ? prev : cams[0].id));
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // Load this camera's saved zones whenever the selected camera changes.
   useEffect(() => {
