@@ -7,12 +7,23 @@ Supports hardware acceleration via TensorRT (.engine) and OpenVINO formats for b
 
 import os
 import logging
+import threading
 from pathlib import Path
 from ultralytics import YOLO
 import numpy as np
 import supervision as sv
 
 logger = logging.getLogger(__name__)
+
+# Serializes model construction across threads. The API runs one CameraWorker
+# thread per camera, and they build their Detectors at nearly the same instant
+# on startup. If a weights file isn't cached yet, each YOLO(...) call tries to
+# download it to the SAME path concurrently and they race on the temp-file
+# rename — which fails on Windows with "[WinError 5] Access is denied". With
+# this lock, the first thread downloads-and-loads while the rest wait, then
+# they find the file already present and just load it. Cheap: only the
+# one-time model load is serialized, not detection.
+_MODEL_LOAD_LOCK = threading.Lock()
 
 # COCO class ids for vehicles and humans
 RELEVANT_CLASS_IDS = {0, 2, 3, 5, 7}
@@ -44,11 +55,14 @@ class Detector:
         base_path = self._resolve_model_path(base_weights)
         pose_path = self._resolve_model_path(pose_weights)
 
-        logger.info("Initializing Base Detector with: %s", base_path)
-        self.base_detector = YOLO(base_path)
+        # One thread loads (and, if needed, downloads) the weights at a time,
+        # so concurrent CameraWorker startups can't race on the same download.
+        with _MODEL_LOAD_LOCK:
+            logger.info("Initializing Base Detector with: %s", base_path)
+            self.base_detector = YOLO(base_path)
 
-        logger.info("Initializing Pose Estimator with: %s", pose_path)
-        self.pose_estimator = YOLO(pose_path)
+            logger.info("Initializing Pose Estimator with: %s", pose_path)
+            self.pose_estimator = YOLO(pose_path)
 
         self.conf_threshold = conf_threshold
         self.device = device

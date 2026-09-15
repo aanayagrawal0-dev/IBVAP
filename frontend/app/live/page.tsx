@@ -5,14 +5,16 @@ import { Bell, Settings, User, Search, Wind, Thermometer, Eye } from "lucide-rea
 import { VideoPanel } from "@/components/video-panel";
 import { AnimatedAlertList } from "@/components/animated-alert-list";
 import { cn } from "@/lib/utils";
-import { cameras, initialAlerts, alertStream, type Alert } from "@/lib/mock-data";
+import { initialAlerts, alertStream, type Alert } from "@/lib/mock-data";
 import { API_BASE, WS_ALERTS_URL } from "@/lib/config";
+import { fetchCameraOptions, FALLBACK_CAMERAS, type CameraOption } from "@/lib/cameras";
 
 let nextAlertId = 100;
 const FALLBACK_TIMEOUT_MS = 3000;
 
 export default function LiveFeedPage() {
-  const [activeCamera, setActiveCamera] = useState(cameras[0].id);
+  const [cameras, setCameras] = useState<CameraOption[]>(FALLBACK_CAMERAS);
+  const [activeCamera, setActiveCamera] = useState(FALLBACK_CAMERAS[0].id);
   const [alerts, setAlerts] = useState<Alert[]>(initialAlerts);
   const [now, setNow] = useState("");
   const [backendConnected, setBackendConnected] = useState(false);
@@ -21,6 +23,20 @@ export default function LiveFeedPage() {
   // all-camera filtering of the (potentially very busy, multi-camera)
   // live alert feed.
   const [cameraFilter, setCameraFilter] = useState<Set<string>>(new Set());
+
+  // Registry drives the camera list — fetch it on mount (falls back to the
+  // built-in list only if the backend is unreachable).
+  useEffect(() => {
+    let cancelled = false;
+    fetchCameraOptions().then((cams) => {
+      if (cancelled || cams.length === 0) return;
+      setCameras(cams);
+      setActiveCamera((prev) => (cams.some((c) => c.id === prev) ? prev : cams[0].id));
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // Client-only clock — avoids a server/client render mismatch from
   // formatting a live timestamp during SSR.
@@ -187,9 +203,9 @@ export default function LiveFeedPage() {
                   <span
                     className={cn(
                       "h-1.5 w-1.5 shrink-0 rounded-full",
-                      cam.status === "alert" ? "bg-critical" : "bg-emerald-500"
+                      cam.status === "nominal" ? "bg-emerald-500" : "bg-ink-dim"
                     )}
-                    aria-label={cam.status === "alert" ? "Active alert" : "Nominal"}
+                    aria-label={cam.status === "nominal" ? "Online" : "Offline"}
                   />
                 </div>
               </button>

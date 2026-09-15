@@ -2,12 +2,14 @@
 
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { Video, LayoutGrid, History, BarChart3, ShieldCheck, LogOut } from "lucide-react";
+import { Video, LayoutGrid, History, BarChart3, ShieldCheck, LogOut, MapPin, ListChecks } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { logout } from "@/lib/auth";
 
 const NAV_ITEMS = [
   { href: "/live", label: "Live Feed", icon: Video },
+  { href: "/registry", label: "Registry", icon: MapPin },
+  { href: "/watchlist", label: "Watchlist", icon: ListChecks },
   { href: "/zone-config", label: "Zone Config", icon: LayoutGrid },
   { href: "/history", label: "History", icon: History },
   { href: "/analytics", label: "Analytics", icon: BarChart3 },
