@@ -12,6 +12,7 @@ import {
   AlertTriangle,
   CheckCircle2,
   Radio,
+  ShieldAlert,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import {
@@ -22,20 +23,12 @@ import {
   importCamerasCsv,
   exportCamerasCsvUrl,
   CONNECTIVITY_LABEL,
+  HEALTH_LABEL,
   type RegistryCamera,
   type CameraInput,
   type ImportResult,
 } from "@/lib/cameras";
-
-// Leaflet is loaded from CDN at runtime (client-only) rather than bundled —
-// avoids react-leaflet/SSR "window is not defined" headaches and keeps the
-// dependency footprint zero. This is the app itself, so a CDN is fine.
-const LEAFLET_CSS = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.css";
-const LEAFLET_JS = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.js";
-// Dark basemap so the map fits the obsidian theme (no API key required).
-const DARK_TILES = "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png";
-const TILE_ATTR =
-  '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>';
+import { loadLeaflet, DARK_TILES, TILE_ATTR, escapeHtml } from "@/lib/leaflet";
 
 const STATUS_COLOR: Record<RegistryCamera["connectivity"], string> = {
   online: "#22C55E",
@@ -43,35 +36,6 @@ const STATUS_COLOR: Record<RegistryCamera["connectivity"], string> = {
   disabled: "#71717A",
   "no-source": "#3B82F6",
 };
-
-function loadLeaflet(): Promise<any> {
-  return new Promise((resolve, reject) => {
-    const w = window as any;
-    if (w.L) return resolve(w.L);
-
-    if (!document.querySelector(`link[href="${LEAFLET_CSS}"]`)) {
-      const link = document.createElement("link");
-      link.rel = "stylesheet";
-      link.href = LEAFLET_CSS;
-      document.head.appendChild(link);
-    }
-
-    const existing = document.querySelector(`script[src="${LEAFLET_JS}"]`) as HTMLScriptElement | null;
-    if (existing) {
-      if (w.L) return resolve(w.L);
-      existing.addEventListener("load", () => resolve((window as any).L));
-      existing.addEventListener("error", reject);
-      return;
-    }
-
-    const script = document.createElement("script");
-    script.src = LEAFLET_JS;
-    script.async = true;
-    script.onload = () => resolve((window as any).L);
-    script.onerror = () => reject(new Error("Failed to load Leaflet from CDN"));
-    document.head.appendChild(script);
-  });
-}
 
 type FormState = {
   id: string;
@@ -570,6 +534,12 @@ export default function RegistryPage() {
                         {cam.streaming && <Radio className="h-3 w-3 text-emerald-400" />}
                         <span className="text-ink-muted">{CONNECTIVITY_LABEL[cam.connectivity]}</span>
                       </span>
+                      {cam.health?.issue && (
+                        <span className="mt-1 flex items-center gap-1 text-[10px] font-mono uppercase text-critical">
+                          <ShieldAlert className="h-3 w-3" />
+                          {HEALTH_LABEL[cam.health.issue] || cam.health.issue}
+                        </span>
+                      )}
                     </td>
                     <td className="px-3 py-2 font-mono text-ink-dim">
                       {cam.lat != null && cam.lon != null ? `${cam.lat.toFixed(4)}, ${cam.lon.toFixed(4)}` : "—"}
@@ -624,10 +594,4 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
       {children}
     </label>
   );
-}
-
-function escapeHtml(s: string): string {
-  return s.replace(/[&<>"']/g, (c) => (
-    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c] as string
-  ));
 }

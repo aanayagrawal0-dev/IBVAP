@@ -1,4 +1,5 @@
 import { API_BASE } from "@/lib/config";
+import { apiFetch, withToken } from "@/lib/auth";
 
 export interface Point {
   x: number; // percentage 0-100 of frame width
@@ -25,7 +26,7 @@ function fromWire(raw: { name: string; polygon: number[][] }[]): ZoneDef[] {
 }
 
 export async function getZones(cameraId: string): Promise<ZoneDef[]> {
-  const res = await fetch(`${API_BASE}/api/zones/${encodeURIComponent(cameraId)}`);
+  const res = await apiFetch(`${API_BASE}/api/zones/${encodeURIComponent(cameraId)}`);
   if (!res.ok) throw new Error(`Failed to load zones (${res.status})`);
   const data = await res.json();
   return fromWire(data.zones ?? []);
@@ -37,7 +38,7 @@ export async function saveZones(
   cameraId: string,
   zones: ZoneDef[]
 ): Promise<{ hotReloaded: boolean }> {
-  const res = await fetch(`${API_BASE}/api/zones/${encodeURIComponent(cameraId)}`, {
+  const res = await apiFetch(`${API_BASE}/api/zones/${encodeURIComponent(cameraId)}`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ zones: toWire(zones) }),

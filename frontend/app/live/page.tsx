@@ -1,13 +1,15 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Bell, Settings, User, Search, Wind, Thermometer, Eye } from "lucide-react";
+import { Bell, Settings, User, Search, Wind, Thermometer, Eye, ShieldAlert } from "lucide-react";
 import { VideoPanel } from "@/components/video-panel";
 import { AnimatedAlertList } from "@/components/animated-alert-list";
 import { cn } from "@/lib/utils";
 import { initialAlerts, alertStream, type Alert } from "@/lib/mock-data";
 import { API_BASE, WS_ALERTS_URL } from "@/lib/config";
 import { fetchCameraOptions, FALLBACK_CAMERAS, type CameraOption } from "@/lib/cameras";
+import { withToken } from "@/lib/auth";
+import { exportRedactedClip } from "@/lib/audit";
 
 let nextAlertId = 100;
 const FALLBACK_TIMEOUT_MS = 3000;
@@ -23,6 +25,18 @@ export default function LiveFeedPage() {
   // all-camera filtering of the (potentially very busy, multi-camera)
   // live alert feed.
   const [cameraFilter, setCameraFilter] = useState<Set<string>>(new Set());
+  const [exportState, setExportState] = useState<"idle" | "exporting" | "error">("idle");
+
+  const handleExportRedacted = async () => {
+    setExportState("exporting");
+    try {
+      await exportRedactedClip(activeCamera, 4);
+      setExportState("idle");
+    } catch {
+      setExportState("error");
+      setTimeout(() => setExportState("idle"), 4000);
+    }
+  };
 
   // Registry drives the camera list — fetch it on mount (falls back to the
   // built-in list only if the backend is unreachable).
@@ -70,7 +84,7 @@ export default function LiveFeedPage() {
 
     let ws: WebSocket | null = null;
     try {
-      ws = new WebSocket(WS_ALERTS_URL);
+      ws = new WebSocket(withToken(WS_ALERTS_URL));
       ws.onopen = () => {
         clearTimeout(connectTimeout);
         setBackendConnected(true);
@@ -139,6 +153,21 @@ export default function LiveFeedPage() {
           </label>
           <button
             type="button"
+            onClick={handleExportRedacted}
+            disabled={exportState === "exporting"}
+            title={`Export a privacy-redacted clip of ${activeCamera} (bystanders auto-blurred)`}
+            className={cn(
+              "flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-[11px] font-semibold uppercase tracking-wide2 disabled:opacity-60",
+              exportState === "error"
+                ? "border-critical/50 text-critical"
+                : "border-obsidian-border text-ink-muted hover:border-safety-500 hover:text-safety-500"
+            )}
+          >
+            <ShieldAlert className="h-3.5 w-3.5" />
+            {exportState === "exporting" ? "Redacting…" : exportState === "error" ? "Export failed" : "Redacted clip"}
+          </button>
+          <button
+            type="button"
             aria-label="Notifications, 1 unread"
             className="relative rounded-md p-1.5 text-ink-muted hover:bg-obsidian-800 hover:text-ink"
           >
@@ -174,7 +203,7 @@ export default function LiveFeedPage() {
             cameraId={activeCamera}
             cameraLabel={`${activeCamera} / ${active.label}`}
             timestamp={now}
-            streamUrl={`${API_BASE}/api/stream/${activeCamera}`}
+            streamUrl={withToken(`${API_BASE}/api/stream/${activeCamera}`)}
           />
 
           {/* Camera thumbnails */}
