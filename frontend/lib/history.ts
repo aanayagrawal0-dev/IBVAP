@@ -1,4 +1,5 @@
 import { API_BASE } from "@/lib/config";
+import { apiFetch, withToken } from "@/lib/auth";
 import type { Severity } from "@/lib/mock-data";
 
 export interface HistoryEvent {
@@ -37,19 +38,19 @@ function buildParams(filters: HistoryFilters): URLSearchParams {
 export async function getHistory(
   filters: HistoryFilters = {}
 ): Promise<{ events: HistoryEvent[]; total: number }> {
-  const res = await fetch(`${API_BASE}/api/history?${buildParams(filters)}`);
+  const res = await apiFetch(`${API_BASE}/api/history?${buildParams(filters)}`);
   if (!res.ok) throw new Error(`Failed to load history (${res.status})`);
   return res.json();
 }
 
 export function thumbnailUrl(event: HistoryEvent): string | null {
-  return event.thumbnailUrl ? `${API_BASE}${event.thumbnailUrl}` : null;
+  return event.thumbnailUrl ? withToken(`${API_BASE}${event.thumbnailUrl}`) : null;
 }
 
 /** Opens the same filtered event log as a CSV download, generated
  * server-side from the real database — used by History's "Export Log". */
 export function exportHistoryCsvUrl(filters: HistoryFilters = {}): string {
-  return `${API_BASE}/api/history/export.csv?${buildParams(filters)}`;
+  return withToken(`${API_BASE}/api/history/export.csv?${buildParams(filters)}`);
 }
 
 /** On-demand Gemini explanation for one event — only called the first time
@@ -61,7 +62,7 @@ export function exportHistoryCsvUrl(filters: HistoryFilters = {}): string {
 export async function explainEvent(
   id: number
 ): Promise<{ explanation: string; cached: boolean }> {
-  const res = await fetch(`${API_BASE}/api/history/${id}/explain`, { method: "POST" });
+  const res = await apiFetch(`${API_BASE}/api/history/${id}/explain`, { method: "POST" });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
     throw new Error(data.detail || `Failed to get explanation (${res.status})`);
