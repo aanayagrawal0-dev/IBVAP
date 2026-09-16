@@ -1,4 +1,5 @@
 import { API_BASE } from "@/lib/config";
+import { apiFetch, withToken } from "@/lib/auth";
 
 /** A camera as the backend registry (camera_store) returns it, with live
  * runtime status merged in by the API (streaming / connectivity). This is
@@ -18,7 +19,25 @@ export interface RegistryCamera {
   enabled: boolean;
   streaming: boolean;
   connectivity: "online" | "offline" | "disabled" | "no-source";
+  health?: CameraHealth | null;
 }
+
+/** Phase 6.1 tampering/health status merged in by the API. */
+export interface CameraHealth {
+  state: string | null; // ok | covered | defocus | scene_change | warming_up | unknown
+  issue: string | null;
+  healthy: boolean | null;
+  metrics?: Record<string, number | null>;
+}
+
+export const HEALTH_LABEL: Record<string, string> = {
+  ok: "Healthy",
+  covered: "Lens covered",
+  defocus: "Defocused",
+  scene_change: "View changed",
+  warming_up: "Calibrating",
+  unknown: "—",
+};
 
 export type CameraStatus = "nominal" | "offline";
 
@@ -49,7 +68,7 @@ export function toCameraOption(c: RegistryCamera): CameraOption {
 }
 
 export async function fetchCameras(): Promise<RegistryCamera[]> {
-  const res = await fetch(`${API_BASE}/api/cameras`);
+  const res = await apiFetch(`${API_BASE}/api/cameras`);
   if (!res.ok) throw new Error(`Failed to load cameras (${res.status})`);
   const data = await res.json();
   return data.cameras as RegistryCamera[];
@@ -84,7 +103,7 @@ async function parseError(res: Response, fallback: string): Promise<string> {
 }
 
 export async function createCamera(payload: CameraInput): Promise<RegistryCamera> {
-  const res = await fetch(`${API_BASE}/api/cameras`, {
+  const res = await apiFetch(`${API_BASE}/api/cameras`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -94,7 +113,7 @@ export async function createCamera(payload: CameraInput): Promise<RegistryCamera
 }
 
 export async function updateCamera(id: string, payload: CameraInput): Promise<RegistryCamera> {
-  const res = await fetch(`${API_BASE}/api/cameras/${encodeURIComponent(id)}`, {
+  const res = await apiFetch(`${API_BASE}/api/cameras/${encodeURIComponent(id)}`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -104,7 +123,7 @@ export async function updateCamera(id: string, payload: CameraInput): Promise<Re
 }
 
 export async function deleteCamera(id: string): Promise<void> {
-  const res = await fetch(`${API_BASE}/api/cameras/${encodeURIComponent(id)}`, {
+  const res = await apiFetch(`${API_BASE}/api/cameras/${encodeURIComponent(id)}`, {
     method: "DELETE",
   });
   if (!res.ok) throw new Error(await parseError(res, "Failed to delete camera"));
@@ -117,7 +136,7 @@ export interface ImportResult {
 }
 
 export async function importCamerasCsv(csv: string): Promise<ImportResult> {
-  const res = await fetch(`${API_BASE}/api/cameras/import`, {
+  const res = await apiFetch(`${API_BASE}/api/cameras/import`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ csv }),
@@ -127,7 +146,7 @@ export async function importCamerasCsv(csv: string): Promise<ImportResult> {
 }
 
 export function exportCamerasCsvUrl(): string {
-  return `${API_BASE}/api/cameras/export.csv`;
+  return withToken(`${API_BASE}/api/cameras/export.csv`);
 }
 
 export const CONNECTIVITY_LABEL: Record<RegistryCamera["connectivity"], string> = {

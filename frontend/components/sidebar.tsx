@@ -2,27 +2,45 @@
 
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { Video, LayoutGrid, History, BarChart3, ShieldCheck, LogOut, MapPin, ListChecks } from "lucide-react";
+import {
+  Video, LayoutGrid, History, BarChart3, ShieldCheck, LogOut, MapPin, ListChecks, Route, ClipboardList,
+  type LucideIcon,
+} from "lucide-react";
 import { cn } from "@/lib/utils";
-import { logout } from "@/lib/auth";
+import { logout, hasRole, type OperatorSession, type Role } from "@/lib/auth";
 
-const NAV_ITEMS = [
+type NavItem = { href: string; label: string; icon: LucideIcon; minRole?: Role };
+
+// minRole gates a nav item; undefined = visible to everyone signed in.
+const NAV_ITEMS: NavItem[] = [
   { href: "/live", label: "Live Feed", icon: Video },
   { href: "/registry", label: "Registry", icon: MapPin },
   { href: "/watchlist", label: "Watchlist", icon: ListChecks },
+  { href: "/route", label: "Route", icon: Route },
   { href: "/zone-config", label: "Zone Config", icon: LayoutGrid },
   { href: "/history", label: "History", icon: History },
+  { href: "/audit", label: "Audit Log", icon: ClipboardList, minRole: "operator" as const },
   { href: "/analytics", label: "Analytics", icon: BarChart3 },
 ];
 
-export function Sidebar({ operatorId = "OP-774" }: { operatorId?: string }) {
+const ROLE_LABEL: Record<string, string> = { viewer: "Viewer", operator: "Operator", admin: "Administrator" };
+
+function initials(name: string): string {
+  const parts = name.replace(/[^A-Za-z ]/g, "").trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 0) return "OP";
+  return (parts[0][0] + (parts[1]?.[0] ?? "")).toUpperCase();
+}
+
+export function Sidebar({ session }: { session: OperatorSession | null }) {
   const pathname = usePathname();
   const router = useRouter();
 
-  const handleLogout = () => {
-    logout();
+  const handleLogout = async () => {
+    await logout();
     router.replace("/login");
   };
+
+  const items = NAV_ITEMS.filter((it) => !it.minRole || hasRole(session, it.minRole));
 
   return (
     <aside
@@ -33,17 +51,13 @@ export function Sidebar({ operatorId = "OP-774" }: { operatorId?: string }) {
         <div className="px-5 py-6 border-b border-obsidian-border">
           <div className="flex items-center gap-2">
             <ShieldCheck className="h-5 w-5 text-safety-500" aria-hidden="true" />
-            <span className="font-headline text-lg font-bold tracking-tight2 text-ink">
-              PRAHARI
-            </span>
+            <span className="font-headline text-lg font-bold tracking-tight2 text-ink">PRAHARI</span>
           </div>
-          <p className="mt-1 text-[11px] uppercase tracking-wide2 text-ink-dim">
-            Border Security Hub
-          </p>
+          <p className="mt-1 text-[11px] uppercase tracking-wide2 text-ink-dim">GSP CCTV Command</p>
         </div>
 
         <nav className="px-3 py-4 flex flex-col gap-1">
-          {NAV_ITEMS.map((item) => {
+          {items.map((item) => {
             const active = pathname?.startsWith(item.href);
             const Icon = item.icon;
             return (
@@ -72,11 +86,13 @@ export function Sidebar({ operatorId = "OP-774" }: { operatorId?: string }) {
           className="h-9 w-9 rounded-full bg-obsidian-700 flex items-center justify-center text-xs font-mono text-ink-muted"
           aria-hidden="true"
         >
-          OP
+          {initials(session?.displayName || session?.username || "OP")}
         </div>
         <div className="min-w-0 flex-1">
-          <p className="text-xs font-medium text-ink truncate">{operatorId}</p>
-          <p className="text-[10px] uppercase tracking-wide2 text-safety-500">Active Duty</p>
+          <p className="text-xs font-medium text-ink truncate">{session?.displayName || session?.username || "—"}</p>
+          <p className="text-[10px] uppercase tracking-wide2 text-safety-500">
+            {session ? `${ROLE_LABEL[session.role] ?? session.role}${session.department && session.department !== "*" ? ` · ${session.department}` : ""}` : ""}
+          </p>
         </div>
         <button
           type="button"

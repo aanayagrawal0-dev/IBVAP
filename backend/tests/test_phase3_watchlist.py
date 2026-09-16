@@ -121,8 +121,8 @@ class _FakePipeline:
     def __init__(self, **kw):
         pass
 
-    def stream(self, on_frame, on_event=None, on_watchlist=None, loop=True,
-               target_fps=None, stop_flag=None, night_vision_flag=None):
+    def stream(self, on_frame, on_event=None, on_watchlist=None, on_analytic=None,
+               loop=True, target_fps=None, stop_flag=None, night_vision_flag=None):
         import numpy as np
         i = 0
         while not (stop_flag and stop_flag()):
@@ -134,14 +134,18 @@ class _FakePipeline:
 def test_match_fires_alert_and_logs_event():
     tmp = tempfile.mkdtemp()
     db = os.path.join(tmp, "history.db")
-    from src import api_server, history_store, camera_store
+    from src import api_server, history_store, camera_store, auth_store, audit_store
     history_store._DB_PATH = db
     history_store._THUMB_DIR = os.path.join(tmp, "thumbs")
     camera_store._DB_PATH = db
     watchlist._DB_PATH = db
+    auth_store._DB_PATH = db
+    audit_store._DB_PATH = db
     api_server.Pipeline = _FakePipeline
 
     with TestClient(api_server.app) as client:
+        tok = client.post("/api/auth/login", json={"username": "admin", "password": "admin123"}).json()["token"]
+        client.headers.update({"Authorization": f"Bearer {tok}"})
         _drain_alerts(api_server)  # clear anything from startup
 
         # 1. add a plate to the watchlist

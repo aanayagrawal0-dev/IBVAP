@@ -7,6 +7,7 @@ import { BreachTrendChart } from "@/components/breach-trend-chart";
 import { ActivityHeatmap } from "@/components/activity-heatmap";
 import { stats } from "@/lib/mock-data";
 import { API_BASE } from "@/lib/config";
+import { apiFetch } from "@/lib/auth";
 
 const STAT_ICONS = [Activity, Clock, ShieldCheck];
 
@@ -19,7 +20,7 @@ export default function AnalyticsPage() {
   const generateReport = async () => {
     setReportState("generating");
     try {
-      const res = await fetch(`${API_BASE}/api/analytics/report.pdf`);
+      const res = await apiFetch(`${API_BASE}/api/analytics/report.pdf`);
       if (!res.ok) throw new Error(`Report generation failed (${res.status})`);
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);

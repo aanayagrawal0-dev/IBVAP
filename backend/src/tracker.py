@@ -35,6 +35,8 @@ class Tracker:
         self._registry: GlobalTargetRegistry | None = None
         # tracker_id -> cached global_id
         self._global_id_cache: dict[int, int] = {}
+        # tracker_id -> most recent appearance embedding (for route Re-ID fusion)
+        self._embedding_cache: dict[int, np.ndarray] = {}
         # tracker_id -> frame_idx when embedding was last computed
         self._last_reid_frame: dict[int, int] = {}
 
@@ -95,6 +97,7 @@ class Tracker:
                         vec = self._embedder.embed(crop)
                         gid = self._registry.query(vec, camera_id=self.camera_id)
                         self._global_id_cache[tid] = gid
+                        self._embedding_cache[tid] = vec
                         self._last_reid_frame[tid] = frame_idx
 
                 global_ids[i] = self._global_id_cache.get(tid, -1)
@@ -122,4 +125,9 @@ class Tracker:
     def global_id(self, tracker_id):
         """Return the cached global_id for a local tracker_id, or -1."""
         return self._global_id_cache.get(int(tracker_id), -1)
+
+    def last_embedding(self, tracker_id):
+        """Most recent appearance embedding for a tracker_id, or None. Reuses
+        the vector the Re-ID step already computed — no extra forward pass."""
+        return self._embedding_cache.get(int(tracker_id))
 

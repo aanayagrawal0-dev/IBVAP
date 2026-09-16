@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { Thermometer } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { API_BASE } from "@/lib/config";
+import { apiFetch } from "@/lib/auth";
 
 function BoundingBox({
   top,
@@ -131,7 +132,7 @@ export function VideoPanel({
   useEffect(() => {
     if (!showRealStream) return;
     let cancelled = false;
-    fetch(`${API_BASE}/api/thermal/${encodeURIComponent(cameraId)}`)
+    apiFetch(`${API_BASE}/api/thermal/${encodeURIComponent(cameraId)}`)
       .then((res) => res.json())
       .then((data) => {
         if (!cancelled) setThermalOn(Boolean(data.enabled));
@@ -151,7 +152,7 @@ export function VideoPanel({
     setThermalPending(true);
     setThermalOn(next); // optimistic — most toggles succeed instantly
     try {
-      const res = await fetch(`${API_BASE}/api/thermal/${encodeURIComponent(cameraId)}`, {
+      const res = await apiFetch(`${API_BASE}/api/thermal/${encodeURIComponent(cameraId)}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ enabled: next }),

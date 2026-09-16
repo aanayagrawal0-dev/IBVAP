@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from fastapi.testclient import TestClient
 
-from src import api_server, history_store, camera_store
+from src import api_server, history_store, camera_store, auth_store, audit_store
 
 
 class _FakePipeline:
@@ -36,8 +36,8 @@ class _FakePipeline:
     def __init__(self, **kwargs):
         self.source_name = kwargs.get("source_name", "cam")
 
-    def stream(self, on_frame, on_event=None, loop=True, target_fps=None,
-               stop_flag=None, night_vision_flag=None):
+    def stream(self, on_frame, on_event=None, on_watchlist=None, on_analytic=None,
+               loop=True, target_fps=None, stop_flag=None, night_vision_flag=None):
         i = 0
         while not (stop_flag and stop_flag()):
             on_frame(np.full((48, 64, 3), (i * 5) % 255, dtype=np.uint8))
@@ -51,6 +51,8 @@ def _redirect_dbs_to_temp():
     history_store._DB_PATH = db
     history_store._THUMB_DIR = os.path.join(tmp, "thumbs")
     camera_store._DB_PATH = db  # same file, mirroring production
+    auth_store._DB_PATH = db
+    audit_store._DB_PATH = db
     return tmp
 
 
@@ -59,6 +61,11 @@ def run():
     api_server.Pipeline = _FakePipeline  # patch BEFORE startup so seeded workers use it
 
     with TestClient(api_server.app) as client:
+        # Phase 5: endpoints now require auth — log in as admin (sees all
+        # departments) and attach the token to every request.
+        tok = client.post("/api/auth/login", json={"username": "admin", "password": "admin123"}).json()["token"]
+        client.headers.update({"Authorization": f"Bearer {tok}"})
+
         # ---- startup seeded the registry and started workers -------------
         cams = client.get("/api/cameras").json()["cameras"]
         by_id = {c["id"]: c for c in cams}

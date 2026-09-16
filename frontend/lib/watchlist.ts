@@ -1,4 +1,5 @@
 import { API_BASE } from "@/lib/config";
+import { apiFetch, withToken } from "@/lib/auth";
 import type { Severity } from "@/lib/mock-data";
 
 export interface WatchlistEntry {
@@ -18,7 +19,7 @@ async function parseError(res: Response, fallback: string): Promise<string> {
 }
 
 export async function fetchWatchlist(): Promise<WatchlistEntry[]> {
-  const res = await fetch(`${API_BASE}/api/watchlist`);
+  const res = await apiFetch(`${API_BASE}/api/watchlist`);
   if (!res.ok) throw new Error(`Failed to load watchlist (${res.status})`);
   return (await res.json()).entries as WatchlistEntry[];
 }
@@ -28,7 +29,7 @@ export async function addPlate(
   label?: string,
   severity: Severity = "critical"
 ): Promise<WatchlistEntry> {
-  const res = await fetch(`${API_BASE}/api/watchlist`, {
+  const res = await apiFetch(`${API_BASE}/api/watchlist`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ plate, label, severity }),
@@ -38,7 +39,7 @@ export async function addPlate(
 }
 
 export async function setActive(id: number, active: boolean): Promise<WatchlistEntry> {
-  const res = await fetch(`${API_BASE}/api/watchlist/${id}/active`, {
+  const res = await apiFetch(`${API_BASE}/api/watchlist/${id}/active`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ active }),
@@ -48,7 +49,7 @@ export async function setActive(id: number, active: boolean): Promise<WatchlistE
 }
 
 export async function removeEntry(id: number): Promise<void> {
-  const res = await fetch(`${API_BASE}/api/watchlist/${id}`, { method: "DELETE" });
+  const res = await apiFetch(`${API_BASE}/api/watchlist/${id}`, { method: "DELETE" });
   if (!res.ok) throw new Error(await parseError(res, "Failed to delete entry"));
 }
 
@@ -62,7 +63,7 @@ export interface SimulateResult {
 /** Demo/test hook: pretend a camera's ANPR just read `plate`, running the
  * real watchlist check + alert path on the backend. */
 export async function simulateSighting(cameraId: string, plate: string): Promise<SimulateResult> {
-  const res = await fetch(`${API_BASE}/api/watchlist/simulate`, {
+  const res = await apiFetch(`${API_BASE}/api/watchlist/simulate`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ camera_id: cameraId, plate }),

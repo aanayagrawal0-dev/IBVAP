@@ -1,52 +1,64 @@
 /**
- * Demo-grade operator gate.
+ * Operator session — now backed by REAL server-side auth (Phase 5).
  *
- * IMPORTANT: this is a client-side convenience gate ONLY — it keeps casual
- * / accidental access off the dashboard during a demo (e.g. someone else
- * picking up the laptop). It is explicitly NOT production security:
- *   - Credentials are hardcoded in this bundle, not checked server-side.
- *   - The FastAPI backend enforces no auth of its own; anyone who can reach
- *     its port directly can read the stream/alerts regardless of this gate.
- *   - Session state lives in localStorage and can be cleared/forged by
- *     anyone with devtools access.
- * A real deployment needs server-side auth (e.g. OAuth/SSO + backend-
- * enforced tokens) before this ever touches a real border post.
+ * login() authenticates against the FastAPI backend, which validates the
+ * password (PBKDF2, server-side) and issues an opaque session token. The token
+ * is attached as `Authorization: Bearer` to JSON calls (see apiFetch) and as
+ * `?token=` for URLs that can't set headers — the MJPEG stream, WebSocket, and
+ * thumbnail/export links (see withToken). The backend enforces the session and
+ * department RBAC on every protected route; this is no longer a client-only gate.
  */
 
+import { API_BASE } from "@/lib/config";
+
+export type Role = "viewer" | "operator" | "admin";
+
 export type OperatorSession = {
-  operatorId: string;
-  loginAt: string; // ISO timestamp
+  token: string;
+  username: string;
+  role: Role;
+  department: string;
+  displayName: string;
 };
 
 const SESSION_KEY = "ibvap_operator_session";
+const ROLE_RANK: Record<Role, number> = { viewer: 1, operator: 2, admin: 3 };
 
-// Hardcoded demo roster — swap for real backend-verified auth before any
-// real deployment. Passcodes are intentionally simple; this is a hackathon
-// demo gate, not a security boundary.
-const DEMO_OPERATORS: Record<string, string> = {
-  "OP-774": "sentinel2026",
-  "OP-118": "border-watch",
-};
-
-export function login(operatorId: string, passcode: string): OperatorSession | null {
-  const expected = DEMO_OPERATORS[operatorId.trim().toUpperCase()];
-  if (!expected || expected !== passcode) return null;
-
-  const session: OperatorSession = {
-    operatorId: operatorId.trim().toUpperCase(),
-    loginAt: new Date().toISOString(),
-  };
+export async function login(username: string, password: string): Promise<OperatorSession | null> {
   try {
-    localStorage.setItem(SESSION_KEY, JSON.stringify(session));
+    const res = await fetch(`${API_BASE}/api/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: username.trim(), password }),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const session: OperatorSession = {
+      token: data.token,
+      username: data.user.username,
+      role: data.user.role,
+      department: data.user.department,
+      displayName: data.user.display_name,
+    };
+    try {
+      localStorage.setItem(SESSION_KEY, JSON.stringify(session));
+    } catch {
+      // localStorage unavailable — caller still gets the session for this load.
+    }
+    return session;
   } catch {
-    // localStorage unavailable (e.g. private browsing edge cases) — the
-    // caller still gets the session object back for in-memory use this
-    // page load, it just won't survive a refresh.
+    return null; // network / backend down
   }
-  return session;
 }
 
-export function logout() {
+export async function logout(): Promise<void> {
+  if (getSession()) {
+    try {
+      await fetch(`${API_BASE}/api/auth/logout`, { method: "POST", headers: authHeader() });
+    } catch {
+      // best effort — clear locally regardless
+    }
+  }
   try {
     localStorage.removeItem(SESSION_KEY);
   } catch {
@@ -59,9 +71,58 @@ export function getSession(): OperatorSession | null {
     const raw = localStorage.getItem(SESSION_KEY);
     if (!raw) return null;
     const parsed = JSON.parse(raw);
-    if (typeof parsed?.operatorId === "string") return parsed as OperatorSession;
+    if (typeof parsed?.token === "string" && typeof parsed?.username === "string") {
+      return parsed as OperatorSession;
+    }
     return null;
   } catch {
     return null;
   }
+}
+
+export function getToken(): string | null {
+  return getSession()?.token ?? null;
+}
+
+export function authHeader(): Record<string, string> {
+  const t = getToken();
+  return t ? { Authorization: `Bearer ${t}` } : {};
+}
+
+export function hasRole(session: OperatorSession | null, min: Role): boolean {
+  return !!session && ROLE_RANK[session.role] >= ROLE_RANK[min];
+}
+
+/** Confirm the stored session is still valid server-side. Clears it on an
+ * explicit 401; tolerates a network blip by keeping the local session. */
+export async function validateSession(): Promise<OperatorSession | null> {
+  const s = getSession();
+  if (!s) return null;
+  try {
+    const res = await fetch(`${API_BASE}/api/auth/me`, { headers: authHeader() });
+    if (res.status === 401) {
+      try {
+        localStorage.removeItem(SESSION_KEY);
+      } catch {
+        // ignore
+      }
+      return null;
+    }
+    return s;
+  } catch {
+    return s;
+  }
+}
+
+/** Append the session token as a query param for URLs consumed by <img>,
+ * <a href>, window.open or WebSocket, which can't carry an auth header. */
+export function withToken(url: string): string {
+  const t = getToken();
+  if (!t) return url;
+  return url + (url.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(t);
+}
+
+/** fetch() with the Authorization header injected. */
+export async function apiFetch(url: string, opts: RequestInit = {}): Promise<Response> {
+  return fetch(url, { ...opts, headers: { ...(opts.headers || {}), ...authHeader() } });
 }

@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import { usePathname, useRouter } from "next/navigation";
 import { Sidebar } from "@/components/sidebar";
-import { getSession, type OperatorSession } from "@/lib/auth";
+import { validateSession, type OperatorSession } from "@/lib/auth";
 
 const PUBLIC_ROUTES = new Set(["/login"]);
 
@@ -26,12 +26,18 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       setChecked(true);
       return;
     }
-    const current = getSession();
-    setSession(current);
-    setChecked(true);
-    if (!current) {
-      router.replace("/login");
-    }
+    let cancelled = false;
+    // Confirm the session with the backend (GET /api/auth/me) — this is real
+    // server-side validation, not just a localStorage presence check.
+    validateSession().then((current) => {
+      if (cancelled) return;
+      setSession(current);
+      setChecked(true);
+      if (!current) router.replace("/login");
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [isPublicRoute, pathname, router]);
 
   if (isPublicRoute) {
@@ -46,7 +52,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
 
   return (
     <div className="flex min-h-screen">
-      <Sidebar operatorId={session.operatorId} />
+      <Sidebar session={session} />
       <main className="flex-1 min-w-0">{children}</main>
     </div>
   );

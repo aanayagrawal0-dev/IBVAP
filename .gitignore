@@ -13,6 +13,7 @@ backend/history.db
 backend/history.db-wal
 backend/history.db-shm
 backend/history_thumbnails/
+backend/exports/
 backend/.env
 backend/models/
 *.pt

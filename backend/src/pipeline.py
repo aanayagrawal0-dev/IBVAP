@@ -16,7 +16,12 @@ from src.tracker import Tracker
 from src.zones import ZoneManager
 from src.zero_dce import ZeroDCEEnhancer
 from src.anpr import ANPREngine, VEHICLE_CLASS_IDS
-from src import watchlist
+from src import watchlist, route_store, tamper as tamper_mod
+from src.behavior import BehaviorAnalyzer
+from src.weapon import WeaponDetector
+from src.facewatch import FaceWatch
+
+PERSON_CLASS_ID = 0
 
 
 SKELETON_EDGES = [
@@ -58,6 +63,24 @@ class Pipeline:
         self._plate_cache: dict[int, str] = {}
         self._plate_read_frame: dict[int, int] = {}
         self._alerted_watchlist: set[tuple[int, str]] = set()
+
+        # Route reconstruction (Phase 4): record one vehicle sighting per
+        # camera-visit, throttled per tracker, carrying the best plate read and
+        # the appearance embedding (reused from the tracker's Re-ID step).
+        self.source_name = source_name
+        self.sighting_interval = 15
+        self._sighting_frame: dict[int, int] = {}
+
+        # Phase 6 bonus analytics. Tampering runs on the raw frame (cheap, no
+        # GPU); behavior reuses the pose keypoints; weapon + face are two-stage
+        # crop-and-classify stages that stay disabled until a model is provided.
+        self.tamper = tamper_mod.TamperDetector()
+        self.tamper_interval = 8
+        self.tamper_status: dict = {"state": "warming_up", "issue": None, "healthy": False, "metrics": {}}
+        self.behavior: BehaviorAnalyzer | None = None  # lazily built once frame dims are known
+        self.weapon = WeaponDetector()
+        self.facewatch = FaceWatch()
+        self.analytic_interval = 10  # weapon/face throttle (per frame)
 
     def _draw_zones(self, frame):
         h, w = frame.shape[:2]
@@ -105,6 +128,36 @@ class Pipeline:
             self._plate_cache[tid] = plate
             return plate
         return self._plate_cache.get(tid)
+
+    def _run_analytics(self, idx, frame, frame_w, frame_h, persons):
+        """Phase 6 detectors. Returns a list of analytic event dicts (each with
+        type/severity/title/description) — tampering on the raw frame, behavior
+        from pose keypoints, and the (disabled-by-default) weapon/face stages."""
+        events = []
+        person_boxes = [(p["tid"], p["box"]) for p in persons]
+
+        # Camera tampering / health (throttled), computed on the RAW frame.
+        if idx % self.tamper_interval == 0:
+            status = self.tamper.update(frame)
+            self.tamper_status = status
+            if status.get("transitioned") and status.get("issue"):
+                alert = tamper_mod.issue_to_alert(status["issue"], self.source_name)
+                if alert:
+                    events.append({"type": "tamper", "issue": status["issue"], "tracker_id": 0, **alert})
+
+        # Behavioral analytics — every frame (cheap; reuses pose keypoints).
+        if self.behavior is None:
+            self.behavior = BehaviorAnalyzer(fps=float(self.source.fps), frame_w=frame_w, frame_h=frame_h)
+        events.extend(self.behavior.update(idx, persons))
+
+        # Weapon + face — two-stage crop-and-classify, throttled, only if a
+        # model has been provided (otherwise cleanly no-op).
+        if idx % self.analytic_interval == 0 and person_boxes:
+            if self.weapon.enabled:
+                events.extend(self.weapon.detect(frame, person_boxes))
+            if self.facewatch.enabled:
+                events.extend(self.facewatch.check(frame, person_boxes))
+        return events
 
     def run(self, output_path=None, max_frames=None, print_every=25, night_vision=False):
         writer = None
@@ -188,7 +241,7 @@ class Pipeline:
         }
 
     def stream(self, on_frame, on_event=None, loop=True, target_fps=None, stop_flag=None,
-               night_vision_flag=None, on_watchlist=None):
+               night_vision_flag=None, on_watchlist=None, on_analytic=None):
         frame_interval = 1.0 / target_fps if target_fps else None
 
         while True:
@@ -211,6 +264,7 @@ class Pipeline:
                 labels = []
                 fired_this_frame = []
                 watchlist_hits = []
+                persons = []  # for Phase 6 behavior / weapon / face analytics
                 for i in range(len(tracked)):
                     cls_id = int(tracked.class_id[i])
                     tid = int(tracked.tracker_id[i])
@@ -236,8 +290,33 @@ class Pipeline:
                                 self._alerted_watchlist.add((tid, plate))
                                 watchlist_hits.append((plate, entry, tid, class_name))
 
+                        # Record a route sighting (throttled per tracker), with
+                        # the appearance embedding the Re-ID step already made.
+                        last_s = self._sighting_frame.get(tid)
+                        if last_s is None or (idx - last_s) >= self.sighting_interval:
+                            self._sighting_frame[tid] = idx
+                            try:
+                                route_store.record_sighting(
+                                    camera_id=self.source_name,
+                                    tracker_id=tid,
+                                    class_name=class_name,
+                                    ts_epoch=time.time(),
+                                    plate=plate,
+                                    embedding=self.tracker.last_embedding(tid),
+                                )
+                            except Exception:
+                                pass  # never break the CV loop on a DB hiccup
+
                     kpts_xy = kpts_xy_all[i] if kpts_xy_all is not None and i < len(kpts_xy_all) else None
                     kpts_conf = kpts_conf_all[i] if kpts_conf_all is not None and i < len(kpts_conf_all) else None
+
+                    if cls_id == PERSON_CLASS_ID:
+                        persons.append({
+                            "tid": tid,
+                            "box": (float(x1), float(y1), float(x2), float(y2)),
+                            "cx": float(cx), "cy": float(cy),
+                            "kpts_xy": kpts_xy, "kpts_conf": kpts_conf,
+                        })
 
                     for evt in self.zone_manager.update(tid, cx_pct, cy_pct, idx, kpts_xy, kpts_conf, class_id=cls_id):
                         # Tag the event with this vehicle's most recent plate
@@ -263,6 +342,12 @@ class Pipeline:
                             {"plate": plate, "entry": entry, "tracker_id": tid, "class_name": cname},
                             annotated,
                         )
+
+                # ── Phase 6 bonus analytics (tampering / behavior / weapon / face) ──
+                analytic_events = self._run_analytics(idx, frame, frame_w, frame_h, persons)
+                if on_analytic:
+                    for ev in analytic_events:
+                        on_analytic(ev, annotated)
 
                 if frame_interval:
                     elapsed = time.time() - t_start
