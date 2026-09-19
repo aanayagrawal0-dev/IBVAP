@@ -83,29 +83,8 @@ export const alertStream: Omit<Alert, "id" | "timestamp">[] = [
   },
 ];
 
-// Event history is no longer mocked here — the History page reads real,
-// database-backed events from the backend (see lib/history.ts and
-// backend/src/history_store.py).
-
-export const breachTrend = Array.from({ length: 30 }, (_, i) => ({
-  day: i + 1,
-  breaches: Math.round(120 + Math.random() * 380),
-}));
-
-export const activityDensity = {
-  hours: ["00h", "04h", "08h", "12h", "16h", "20h", "24h"],
-  days: ["Mon", "Wed", "Fri", "Sun"],
-  // value 0-1 intensity, deterministic-looking pseudo pattern
-  matrix: [
-    [0.6, 0.3, 0.2, 0.7, 0.5, 0.8, 0.4],
-    [0.4, 0.5, 0.3, 0.9, 0.6, 0.3, 0.5],
-    [0.7, 0.2, 0.4, 0.5, 0.8, 0.6, 0.3],
-    [0.3, 0.6, 0.5, 0.4, 0.7, 0.5, 0.6],
-  ],
-};
-
-export const stats = [
-  { label: "TOTAL DETECTIONS", value: "4,892", delta: "+12% vs last 24h", positive: true },
-  { label: "AVG RESPONSE TIME", value: "1.4s", delta: "-0.2s vs last 24h", positive: true },
-  { label: "SYSTEM CONFIDENCE", value: "99.8%", delta: null, positive: true },
-];
+// Event history and analytics are no longer mocked here — the History page
+// reads real database-backed events (lib/history.ts) and the Analytics page
+// reads live stats + camera health from /api/analytics/summary (lib/analytics.ts).
+// The remaining exports above (initialAlerts / alertStream) are only the
+// offline fallback for the Live alert feed when the WebSocket is unreachable.

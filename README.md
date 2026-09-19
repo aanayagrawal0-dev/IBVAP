@@ -1,11 +1,31 @@
-# IBVAP — Intelligent Border Video Analytics Platform
+# PRAHARI / IBVAP — Statewide CCTV Analytics Platform
 
-**Smart India Hackathon 2026**
+PRAHARI turns existing CCTV — across departments, protocols, and vendors — into an
+AI-assisted surveillance system for the **Gujarat State Police statewide-CCTV** use case
+(built on the IBVAP core). It onboards heterogeneous cameras into a GIS registry, detects
+and tracks people/vehicles, cross-references live feeds against a watchlist, reconstructs a
+vehicle's path across cameras, and does it all behind real backend auth with department
+RBAC and an audit trail — without new camera hardware.
 
-IBVAP turns existing border-security CCTV into an AI-assisted surveillance system: it detects
-people and vehicles in a video feed, tracks them across frames, raises alerts when something
-crosses into a restricted "virtual fence" zone, and shows all of it on a live operations
-dashboard — without needing new camera hardware.
+> **GSP CCTV extension (Phases 0–8).** The original IBVAP border-analytics core has been
+> extended for the statewide brief. New since the core:
+> - **Camera Registry + GIS** (Model 1): runtime camera onboarding (manual / CSV / API) on a
+>   Leaflet map, no restart — the registry, not env vars, is the source of truth.
+> - **Heterogeneous ingestion adapters**: ONVIF → RTSP, HTTP-MJPEG, and recorded clips behind
+>   one frame contract.
+> - **Watchlist engine**: continuous plate cross-referencing → real-time `watchlist_match` alerts.
+> - **Cross-camera route reconstruction**: ANPR + appearance Re-ID fusion, GIS-topology-checked,
+>   plotted on a map.
+> - **Security & privacy**: real backend sessions, department RBAC, an audit log, and
+>   selective bystander redaction on clip export.
+> - **Bonus analytics**: camera tampering/health detection, behavior analytics
+>   (loitering/altercation/snatching), and pluggable weapon + alert-and-verify face stages.
+>
+> Full design & scale-up documentation lives in [`docs/`](docs/): the
+> [High-Level Design](docs/HLD.md), the [80,000-camera scale-up plan](docs/SCALEUP.md),
+> the [cost-benefit / departments / roadmap](docs/COST_BENEFIT_AND_ROADMAP.md), the
+> [API reference](docs/API.md) (+ generated [`openapi.json`](docs/openapi.json)), and the
+> [solution deck](docs/PRESENTATION.md).
 
 ## What's working right now
 
@@ -62,28 +82,26 @@ dashboard — without needing new camera hardware.
 - **Operator login gate** — a lightweight, demo-grade sign-in screen so the dashboard isn't
   wide open to anyone at the keyboard.
 
-## What's mocked or not wired up yet
+## What needs a model or hardware to go fully live
 
-Being upfront about this so it doesn't surprise anyone during a demo or a judge's questions:
+Being upfront so nothing surprises a judge. Everything below is *wired and tested* — it just
+needs an external asset or real device to fire on live footage:
 
-- The **Live Feed**, **Zone Config**, and **History** pages are connected to the real backend
-  (real MJPEG stream, real WebSocket alerts, real zone persistence, real event database). Live
-  Feed falls back to generated mock alerts after a few seconds if the backend isn't reachable, so
-  the UI still demos standalone; History instead shows an explicit "couldn't reach the history
-  service" message rather than silently showing fake data.
-- The **Analytics** page's summary stat cards, 30-day breach trend chart, and activity heatmap
-  are still mock/static data — genuine trend analysis needs history to accumulate over real time,
-  which a fresh demo database won't have yet. **Generate Report** is the one part of that page
-  wired to the real database (see above) — it exports whatever has actually been logged so far,
-  which may be a short list on a freshly started backend.
-- Only cameras with a **source actually configured** run live — CAM-01/02/03 have defaults
-  (webcam / bundled clip / bundled clip), CAM-04 doesn't, so it shows the offline placeholder
-  until you give it a source. The repo ships with several recorded demo clips in `sample_data/`, so CAM-02 and CAM-03
-  can play them (as fully independent decodes) — point them at your own footage or different demo clips via their env vars for visually distinct feeds. Running several concurrent YOLO pipelines is real CPU work; if your machine struggles, disable a camera by clearing its env var rather than running all four.
-- **Face detection** is on the roadmap but not built.
-- The **login gate is client-side only** — credentials are hardcoded in the frontend bundle and
-  the backend API itself doesn't check any token. It's a convenience gate for a demo, not
-  production security.
+- **Live ANPR** needs PaddleOCR installed (`pip install paddleocr paddlepaddle`). Without it the
+  ANPR engine disables cleanly; use the **watchlist "Test a match"** and **route "Inject sightings"**
+  demo hooks to exercise the real match/route/alert path without OCR.
+- **Weapon detection** and **face recognition** are the correct two-stage / alert-and-verify
+  *architectures*, but stay disabled until a fine-tuned model is provided
+  (`IBVAP_WEAPON_MODEL=…`, or a face embedder) — no detections are fabricated.
+- **ONVIF** cameras need `onvif-zeep` installed (in `requirements.txt`) and a real device; the
+  handshake→RTSP path is mocked in tests.
+- Real trend history accrues over time; a freshly started backend shows a short **Analytics**
+  window until events accumulate.
+
+Note the **Analytics** page and the **login/auth** are no longer mock/demo-grade: Analytics reads
+live stats + per-camera health from `GET /api/analytics/summary`, and auth is **real
+backend-enforced sessions with department RBAC** (see [`docs/HLD.md`](docs/HLD.md)). The **Live Feed**
+still falls back to a few generated alerts if the WebSocket is unreachable, so the UI demos standalone.
 
 ## Architecture
 
@@ -150,10 +168,16 @@ cd backend
 python -m uvicorn src.api_server:app --port 8000
 ```
 
-Each camera has its own source, set independently via its own env var before starting the
-server — `IBVAP_CAM01_SOURCE`, `IBVAP_CAM02_SOURCE`, `IBVAP_CAM03_SOURCE`, `IBVAP_CAM04_SOURCE`.
-Leave one unset/empty and that camera just isn't run (offline placeholder in the UI). Defaults:
-CAM-01 → your webcam (`0`), CAM-02/03 → the bundled demo clips, CAM-04 → off.
+> **Cameras are now managed by the Camera Registry**, not env vars — add/edit/remove them at
+> runtime from the **Registry** page (or `POST /api/cameras`, or CSV import) and they start
+> streaming with no restart. The `IBVAP_CAM0x_SOURCE` env vars below now only **seed** the four
+> default cameras on the *first* boot of a fresh `history.db`; after that the registry is the
+> source of truth.
+
+Each seeded camera has its own source — `IBVAP_CAM01_SOURCE`, `IBVAP_CAM02_SOURCE`,
+`IBVAP_CAM03_SOURCE`, `IBVAP_CAM04_SOURCE`. Leave one unset/empty and that camera just isn't run
+(offline placeholder in the UI). Defaults: CAM-01 → your webcam (`0`), CAM-02/03 → the bundled
+demo clips, CAM-04 → off.
 
 ```powershell
 # PowerShell (Windows)
@@ -232,12 +256,16 @@ Open `http://localhost:3000`. You'll land on the login screen first.
 
 ### Demo login
 
-| Operator ID | Passcode |
-|---|---|
-| `OP-774` | `prahari2026` |
-| `OP-118` | `border-watch` |
+Real backend-authenticated users (roles + department scoping):
 
-(Defined in `frontend/lib/auth.ts` — change or add operators there.)
+| Username | Password | Role | Department |
+|---|---|---|---|
+| `admin` | `admin123` | admin | all |
+| `rakesh` | `traffic123` | operator | Traffic Police |
+| `meena` | `viewer123` | viewer | Home Guard |
+
+Log in as different users to see department-scoped camera access and role-gated actions.
+Seeded in `backend/src/auth_store.py` (PBKDF2-hashed, server-side); provision real users there.
 
 ### Zone configuration
 

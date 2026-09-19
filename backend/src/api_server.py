@@ -439,7 +439,35 @@ def _stop_worker(camera_id: str):
 
 
 # --- FastAPI app --------------------------------------------------------
-app = FastAPI(title="IBVAP Bridge API")
+_API_DESCRIPTION = """
+Integration-ready REST + WebSocket API for **PRAHARI** — the Gujarat State
+Police statewide-CCTV platform (IBVAP core).
+
+**Auth:** obtain a token from `POST /api/auth/login`, then send
+`Authorization: Bearer <token>` on JSON calls, or `?token=<token>` on the
+MJPEG stream, WebSocket and thumbnail/export links. Roles: viewer < operator
+< admin; access is scoped by department.
+"""
+
+_OPENAPI_TAGS = [
+    {"name": "Auth", "description": "Login/logout, current user, and user management."},
+    {"name": "Cameras", "description": "Camera registry (Model 1), live MJPEG stream, and health/thermal."},
+    {"name": "Zones", "description": "Per-camera restricted-zone polygons."},
+    {"name": "Watchlist", "description": "Plate watchlist and real-time match alerts."},
+    {"name": "Route Reconstruction", "description": "Cross-camera plate route (ANPR + Re-ID + topology)."},
+    {"name": "History", "description": "Queryable event history and thumbnails."},
+    {"name": "Analytics", "description": "Operational summary + PDF report."},
+    {"name": "Audit", "description": "Who viewed/searched/changed what."},
+    {"name": "Export & Redaction", "description": "Privacy-preserving redacted clip export."},
+    {"name": "System", "description": "Health/readiness."},
+]
+
+app = FastAPI(
+    title="PRAHARI — GSP CCTV API",
+    description=_API_DESCRIPTION,
+    version="1.0.0",
+    openapi_tags=_OPENAPI_TAGS,
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -1195,6 +1223,35 @@ def export_history_csv(
     )
 
 
+@app.get("/api/analytics/summary")
+def analytics_summary(since_hours: float | None = None, user: dict = Depends(current_user)):
+    """Real operational summary straight from the event log plus live camera
+    health — this is what the Analytics dashboard renders instead of mock data.
+    Scoped to the caller's department (admins see all)."""
+    since_epoch = time.time() - since_hours * 3600 if since_hours else None
+    stats = history_store.summary_stats(since_epoch=since_epoch)
+
+    cams = _visible_cameras(user)
+    by_conn = {"online": 0, "offline": 0, "disabled": 0, "no-source": 0}
+    tampered = []
+    cam_list = []
+    for c in cams:
+        sc = _serialize_camera(c)
+        by_conn[sc["connectivity"]] = by_conn.get(sc["connectivity"], 0) + 1
+        health = sc.get("health") or {}
+        if health.get("issue"):
+            tampered.append({"id": c["id"], "name": c.get("name"), "issue": health["issue"]})
+        cam_list.append({
+            "id": c["id"], "name": c.get("name"), "department": c.get("department"),
+            "connectivity": sc["connectivity"], "streaming": sc["streaming"], "health": sc.get("health"),
+        })
+
+    return {
+        "stats": stats,
+        "cameras": {"total": len(cams), "by_connectivity": by_conn, "tampered": tampered, "list": cam_list},
+    }
+
+
 @app.get("/api/analytics/report.pdf")
 def generate_analytics_report(user: dict = Depends(current_user)):
     """Builds a real operational-report PDF straight from the event
@@ -1274,3 +1331,29 @@ def generate_analytics_report(user: dict = Depends(current_user)):
         media_type="application/pdf",
         headers={"Content-Disposition": f'attachment; filename="ibvap_report_{stamp}.pdf"'},
     )
+
+
+# --- OpenAPI grouping -------------------------------------------------------
+# Tag every route by path prefix in one place, so the /docs + /openapi.json
+# spec is cleanly grouped without decorating ~35 route definitions.
+from fastapi.routing import APIRoute as _APIRoute  # noqa: E402
+
+_TAG_BY_PREFIX = [
+    ("/api/auth", "Auth"), ("/api/users", "Auth"),
+    ("/api/stream", "Cameras"), ("/api/thermal", "Cameras"), ("/api/cameras", "Cameras"),
+    ("/api/zones", "Zones"),
+    ("/api/watchlist", "Watchlist"),
+    ("/api/route", "Route Reconstruction"),
+    ("/api/history", "History"),
+    ("/api/analytics", "Analytics"),
+    ("/api/audit", "Audit"),
+    ("/api/export", "Export & Redaction"),
+    ("/api/health", "System"),
+]
+
+for _route in app.routes:
+    if isinstance(_route, _APIRoute):
+        for _prefix, _tag in _TAG_BY_PREFIX:
+            if _route.path.startswith(_prefix):
+                _route.tags = [_tag]
+                break
