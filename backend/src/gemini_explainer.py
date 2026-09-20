@@ -18,11 +18,9 @@ event the CV pipeline logs.
 
 import os
 
-# gemini-2.5-flash was retired for new API keys shortly after this was
-# first written (Google's own 404 points new callers at 3.6-flash instead)
-# — a reminder that Google's model lineup moves fast. Override via
-# GEMINI_MODEL without touching code if this default goes stale again.
-DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
+# Keep this on a stable Flash model from the Gemini API model catalog.
+# Override via GEMINI_MODEL without touching code if this default goes stale.
+DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
 
 _PROMPT_TEMPLATE = """You are an assistant embedded in IBVAP, an AI border-security video \
 analytics system. Below is one automatically detected event from a computer-vision pipeline \
