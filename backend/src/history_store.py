@@ -215,6 +215,7 @@ def insert_event(
 
 def query_events(
     camera_id: str | None = None,
+    camera_ids: list[str] | None = None,
     severity: str | None = None,
     since_epoch: float | None = None,
     limit: int = 50,
@@ -233,6 +234,12 @@ def query_events(
     if camera_id:
         where.append("camera_id = ?")
         params.append(camera_id)
+    elif camera_ids is not None:
+        if not camera_ids:
+            return [], 0
+        placeholders = ", ".join("?" for _ in camera_ids)
+        where.append(f"camera_id IN ({placeholders})")
+        params.extend(camera_ids)
     if severity:
         where.append("severity = ?")
         params.append(severity)
@@ -280,12 +287,28 @@ def set_explanation(event_id: int, text: str):
             conn.execute("UPDATE events SET explanation = ? WHERE id = ?", (text, event_id))
 
 
-def summary_stats(since_epoch: float | None = None) -> dict:
+def summary_stats(since_epoch: float | None = None, camera_ids: list[str] | None = None) -> dict:
     """Aggregates for the analytics report: totals broken down by severity
     and by camera, plus the covered time range — all computed straight
     from the real event log, nothing pre-baked."""
-    where = "WHERE ts_epoch >= ?" if since_epoch is not None else ""
-    params = [since_epoch] if since_epoch is not None else []
+    where_parts = []
+    params = []
+    if since_epoch is not None:
+        where_parts.append("ts_epoch >= ?")
+        params.append(since_epoch)
+    if camera_ids is not None:
+        if not camera_ids:
+            return {
+                "total": 0,
+                "by_severity": {},
+                "by_camera": {},
+                "earliest_ts": None,
+                "latest_ts": None,
+            }
+        placeholders = ", ".join("?" for _ in camera_ids)
+        where_parts.append(f"camera_id IN ({placeholders})")
+        params.extend(camera_ids)
+    where = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
 
     with _lock:
         conn = _get_conn()
