@@ -108,11 +108,19 @@ def test_maybe_read_plate_throttle_and_cache():
 
 # ── end-to-end match -> alert -> DB via the API ────────────────────────────
 
+_test_subscriber: "queue.Queue[dict]" = queue.Queue(maxsize=200)
+
+
 def _drain_alerts(api_server):
+    # Alerts fan out to one queue per subscriber (one per WebSocket), so the
+    # test registers its own subscriber the same way ws_alerts does.
+    with api_server._alert_subscribers_lock:
+        if _test_subscriber not in api_server._alert_subscribers:
+            api_server._alert_subscribers.append(_test_subscriber)
     out = []
     while True:
         try:
-            out.append(api_server._alert_queue.get_nowait())
+            out.append(_test_subscriber.get_nowait())
         except queue.Empty:
             return out
 

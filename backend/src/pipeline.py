@@ -5,6 +5,7 @@ smoke-test harness for the core detect+track+fence loop before the
 alert engine, ANPR, and dashboard layers get bolted on.
 """
 
+import os
 import time
 import cv2
 import numpy as np
@@ -20,8 +21,14 @@ from src import watchlist, route_store, tamper as tamper_mod
 from src.behavior import BehaviorAnalyzer
 from src.weapon import WeaponDetector
 from src.facewatch import FaceWatch
+from src.timing import MediaIndex, SceneCutDetector
 
 PERSON_CLASS_ID = 0
+
+# Nominal rate that PTS is quantised to for the frame-index based stages
+# (tracker, zones, behavior). NOT the camera's rate: CAP_PROP_FPS is never
+# trusted, and every duration/speed is derived from PTS via MediaIndex.
+TRACK_FPS = float(os.environ.get("IBVAP_TRACK_FPS", "15"))
 
 
 SKELETON_EDGES = [
@@ -43,7 +50,16 @@ class Pipeline:
         # contract, so everything below is unchanged regardless of source.
         self.source = open_source(source_uri, name=source_name)
         self.detector = Detector(weights=weights, conf_threshold=conf_threshold)
-        self.tracker = Tracker(frame_rate=int(self.source.fps))
+        self.track_fps = TRACK_FPS
+        self.tracker = Tracker(frame_rate=int(round(self.track_fps)))
+        # PTS-driven timing + hard-cut recovery (gateway loop points,
+        # reconnects, camera reboots). See src/timing.py.
+        self.media_index = MediaIndex(self.track_fps)
+        self.scene_cut = SceneCutDetector()
+        self.frame_pts_s = None
+        self.frame_ts_epoch = None
+        self.scene_resets = 0
+        self.last_scene_reset = None
         self.zone_manager = zone_manager
         self.enhancer = ZeroDCEEnhancer()
         self.night_vision = night_vision
@@ -129,7 +145,44 @@ class Pipeline:
             return plate
         return self._plate_cache.get(tid)
 
-    def _run_analytics(self, idx, frame, frame_w, frame_h, persons):
+    def _frame_timing(self, frame):
+        """PTS-derived timing for the frame just yielded by the source, plus
+        scene-discontinuity handling. Returns the media frame index that all
+        timing-sensitive stages use."""
+        pts = getattr(self.source, "last_pts_s", None)
+        ts_epoch = getattr(self.source, "last_ts_epoch", None)
+        if pts is None:  # adapter without timing support: monotonic fallback
+            pts = time.monotonic()
+            ts_epoch = time.time()
+        self.frame_pts_s = pts
+        self.frame_ts_epoch = ts_epoch
+
+        reason = None
+        if getattr(self.source, "last_discontinuity", False):
+            reason = "stream discontinuity (reconnect or PTS jump)"
+        elif self.scene_cut.update(frame, pts):
+            reason = "scene cut (feed loop point / camera reboot)"
+        if reason:
+            self._reset_scene_state(reason)
+        return self.media_index.index(pts)
+
+    def _reset_scene_state(self, reason):
+        """Recover from a hard cut: no track, plate, dwell or tamper baseline
+        survives into the new scene. Track ids keep increasing (Tracker.reset),
+        so zone/behavior state keyed on old ids is simply never reused."""
+        self.tracker.reset()
+        self._plate_cache.clear()
+        self._plate_read_frame.clear()
+        self._sighting_frame.clear()
+        self._alerted_watchlist.clear()
+        self.behavior = None  # rebuilt lazily with fresh state
+        self.tamper = tamper_mod.TamperDetector()
+        self.scene_cut.reset()
+        self.scene_resets += 1
+        self.last_scene_reset = {"reason": reason, "pts_s": self.frame_pts_s, "ts_epoch": self.frame_ts_epoch}
+        print(f"[{self.source_name}] {reason} -> scene state reset")
+
+    def _run_analytics(self, idx, vidx, frame, frame_w, frame_h, persons):
         """Phase 6 detectors. Returns a list of analytic event dicts (each with
         type/severity/title/description) — tampering on the raw frame, behavior
         from pose keypoints, and the (disabled-by-default) weapon/face stages."""
@@ -147,8 +200,8 @@ class Pipeline:
 
         # Behavioral analytics — every frame (cheap; reuses pose keypoints).
         if self.behavior is None:
-            self.behavior = BehaviorAnalyzer(fps=float(self.source.fps), frame_w=frame_w, frame_h=frame_h)
-        events.extend(self.behavior.update(idx, persons))
+            self.behavior = BehaviorAnalyzer(fps=self.track_fps, frame_w=frame_w, frame_h=frame_h)
+        events.extend(self.behavior.update(vidx, persons))
 
         # Weapon + face — two-stage crop-and-classify, throttled, only if a
         # model has been provided (otherwise cleanly no-op).
@@ -169,11 +222,12 @@ class Pipeline:
             if max_frames and idx >= max_frames:
                 break
 
+            vidx = self._frame_timing(frame)
             if night_vision or self.night_vision:
                 frame = self.enhancer.enhance(frame)
 
             detections = self.detector.detect(frame)
-            tracked = self.tracker.update(detections, idx, frame_bgr=frame)
+            tracked = self.tracker.update(detections, vidx, frame_bgr=frame)
             detection_count += len(tracked)
             frame_h, frame_w = frame.shape[:2]
 
@@ -194,7 +248,7 @@ class Pipeline:
                 kpts_xy = kpts_xy_all[i] if kpts_xy_all is not None and i < len(kpts_xy_all) else None
                 kpts_conf = kpts_conf_all[i] if kpts_conf_all is not None and i < len(kpts_conf_all) else None
 
-                for evt in self.zone_manager.update(tid, cx_pct, cy_pct, idx, kpts_xy, kpts_conf, class_id=cls_id):
+                for evt in self.zone_manager.update(tid, cx_pct, cy_pct, vidx, kpts_xy, kpts_conf, class_id=cls_id):
                     # Run ANPR for vehicle targets on alert frames
                     if cls_id in VEHICLE_CLASS_IDS:
                         plate = self.anpr_engine.extract_plate(frame, x1, y1, x2, y2)
@@ -249,13 +303,14 @@ class Pipeline:
                 if stop_flag and stop_flag():
                     return
                 t_start = time.time()
+                vidx = self._frame_timing(frame)
 
                 is_night_vision = night_vision_flag() if callable(night_vision_flag) else self.night_vision
                 if is_night_vision:
                     frame = self.enhancer.enhance(frame)
 
                 detections = self.detector.detect(frame)
-                tracked = self.tracker.update(detections, idx, frame_bgr=frame)
+                tracked = self.tracker.update(detections, vidx, frame_bgr=frame)
                 frame_h, frame_w = frame.shape[:2]
 
                 kpts_xy_all = tracked.data.get("keypoints_xy") if hasattr(tracked, "data") else None
@@ -300,7 +355,7 @@ class Pipeline:
                                     camera_id=self.source_name,
                                     tracker_id=tid,
                                     class_name=class_name,
-                                    ts_epoch=time.time(),
+                                    ts_epoch=self.frame_ts_epoch,
                                     plate=plate,
                                     embedding=self.tracker.last_embedding(tid),
                                 )
@@ -318,7 +373,7 @@ class Pipeline:
                             "kpts_xy": kpts_xy, "kpts_conf": kpts_conf,
                         })
 
-                    for evt in self.zone_manager.update(tid, cx_pct, cy_pct, idx, kpts_xy, kpts_conf, class_id=cls_id):
+                    for evt in self.zone_manager.update(tid, cx_pct, cy_pct, vidx, kpts_xy, kpts_conf, class_id=cls_id):
                         # Tag the event with this vehicle's most recent plate
                         # read (already OCR'd above — don't re-run OCR here).
                         evt.license_plate = plate if cls_id in VEHICLE_CLASS_IDS else None
@@ -344,7 +399,7 @@ class Pipeline:
                         )
 
                 # ── Phase 6 bonus analytics (tampering / behavior / weapon / face) ──
-                analytic_events = self._run_analytics(idx, frame, frame_w, frame_h, persons)
+                analytic_events = self._run_analytics(idx, vidx, frame, frame_w, frame_h, persons)
                 if on_analytic:
                     for ev in analytic_events:
                         on_analytic(ev, annotated)

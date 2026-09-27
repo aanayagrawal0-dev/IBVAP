@@ -116,8 +116,16 @@ def seed_users(users=DEFAULT_USERS):
 
 
 def add_user(username, password, role, department, display_name=None) -> dict:
+    username = (username or "").strip()
+    department = (department or "").strip()
+    if not username:
+        raise ValueError("Username is required.")
+    if not password:
+        raise ValueError("Password is required.")
     if role not in ROLE_RANK:
         raise ValueError(f"Unknown role '{role}'.")
+    if not department:
+        raise ValueError("Department is required.")
     now = time.time()
     with _lock:
         conn = _get_conn()
@@ -131,6 +139,48 @@ def add_user(username, password, role, department, display_name=None) -> dict:
             )
     return {"username": username, "role": role, "department": department,
             "display_name": display_name or username}
+
+
+def update_user(username, password=None, role=None, department=None, display_name=None) -> dict | None:
+    username = (username or "").strip()
+    updates = {}
+    if password is not None:
+        if not password:
+            raise ValueError("Password cannot be empty.")
+        updates["password_hash"] = _hash_password(password)
+    if role is not None:
+        if role not in ROLE_RANK:
+            raise ValueError(f"Unknown role '{role}'.")
+        updates["role"] = role
+    if department is not None:
+        department = department.strip()
+        if not department:
+            raise ValueError("Department cannot be empty.")
+        updates["department"] = department
+    if display_name is not None:
+        updates["display_name"] = display_name.strip() or username
+
+    with _lock:
+        conn = _get_conn()
+        if conn.execute("SELECT 1 FROM users WHERE username = ?", (username,)).fetchone() is None:
+            return None
+        if updates:
+            set_clause = ", ".join(f"{k} = :{k}" for k in updates)
+            with conn:
+                conn.execute(f"UPDATE users SET {set_clause} WHERE username = :username",
+                             {"username": username, **updates})
+        row = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+        return _public(row)
+
+
+def delete_user(username) -> bool:
+    username = (username or "").strip()
+    with _lock:
+        conn = _get_conn()
+        with conn:
+            cur = conn.execute("DELETE FROM users WHERE username = ?", (username,))
+            conn.execute("DELETE FROM sessions WHERE username = ?", (username,))
+        return cur.rowcount > 0
 
 
 def _public(row: sqlite3.Row) -> dict:

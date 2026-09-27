@@ -51,6 +51,13 @@ curl -s localhost:8000/api/cameras -H "Authorization: Bearer $TOKEN"
 | GET | `/api/cameras/export.csv` | operator | CSV export |
 | GET | `/api/stream/{id}` | any (`?token`) | MJPEG stream (dept-checked; audited) |
 | GET / POST | `/api/thermal/{id}` | any / operator | night-vision toggle |
+| POST | `/api/gateway/sync` | admin | re-read the live gateway catalogue into the registry; start/stop workers to match (`{"apply_active": true}` re-applies `IBVAP_GATEWAY_ACTIVE`) |
+| GET | `/api/gateway/catalog` | operator | last catalogue read (codec, resolution, live status, credential-free URLs) + per-camera transport stats (reconnects, PTS-measured fps, dropped frames, scene resets) |
+
+Each camera's `health.stream` carries the same live transport stats. Gateway
+RTSP is forced over TCP, reconnects with exponential backoff (2 s → 30 s),
+and all timing is PTS-driven — see `backend/.env.example` for the
+`IBVAP_GATEWAY_*` settings.
 
 ### Zones
 | Method | Path | Role |

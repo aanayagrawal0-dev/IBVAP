@@ -27,9 +27,11 @@ import io
 import json
 import os
 import queue
+import re
 import threading
 import time
 from datetime import datetime
+from urllib.parse import urlparse
 
 import cv2
 from dotenv import load_dotenv
@@ -49,13 +51,25 @@ from src.pipeline import Pipeline
 from src.zones import Zone, ZoneManager, ZoneEventType
 from src import (
     history_store, zone_store, camera_store, watchlist, route_store, route,
-    auth_store, audit_store, redaction,
+    auth_store, audit_store, redaction, gateway,
 )
 
 
 # --- Config -----------------------------------------------------------
 WEIGHTS_PATH = "models/yolo11n-pose.pt"
 STREAM_FPS = 15
+MAX_CSV_IMPORT_BYTES = int(os.environ.get("IBVAP_MAX_CSV_IMPORT_BYTES", "200000"))
+DEMO_HOOKS_ENABLED = os.environ.get("IBVAP_ENABLE_DEMO_HOOKS", "1").lower() in ("1", "true", "yes", "on")
+SEED_DEMO_USERS = os.environ.get("IBVAP_SEED_DEMO_USERS", "1").lower() in ("1", "true", "yes", "on")
+ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get("IBVAP_CORS_ORIGINS", "http://localhost:3000").split(",")
+    if origin.strip()
+]
+LOGIN_RATE_LIMIT_WINDOW_S = int(os.environ.get("IBVAP_LOGIN_RATE_LIMIT_WINDOW_S", "300"))
+LOGIN_RATE_LIMIT_MAX_FAILURES = int(os.environ.get("IBVAP_LOGIN_RATE_LIMIT_MAX_FAILURES", "5"))
+_login_failures: dict[str, list[float]] = {}
+_login_failures_lock = threading.Lock()
 # No fixed frame resolution here on purpose — zones are percentage-based
 # and converted against each frame's actual dimensions in pipeline.py, so
 # different cameras can run at whatever resolution their source provides.
@@ -145,21 +159,35 @@ def _apply_thermal_colormap(bgr_frame):
     return cv2.applyColorMap(gray, cv2.COLORMAP_INFERNO)
 
 
-# --- One alert stream shared by every camera, each alert tagged with which
-# camera raised it ------------------------------------------------------
-_alert_queue: "queue.Queue[dict]" = queue.Queue(maxsize=200)
+# --- Live alert fanout -------------------------------------------------
+# Each WebSocket gets its own bounded queue. A single shared queue would be
+# load-balanced across tabs, and with department RBAC an unauthorized tab could
+# drain an alert before the authorized tab sees it.
+_alert_subscribers: list["queue.Queue[dict]"] = []
+_alert_subscribers_lock = threading.Lock()
+
+
+def _publish_alert(alert: dict):
+    with _alert_subscribers_lock:
+        subscribers = list(_alert_subscribers)
+    for subscriber in subscribers:
+        try:
+            subscriber.put_nowait(alert)
+        except queue.Full:
+            pass
 
 # Thumbnails are stored at reduced size — a live 1280x720 frame doesn't
 # need to be saved full-res just to show "what triggered this" in History.
 THUMBNAIL_MAX_WIDTH = 320
 
 
-def _emit_watchlist_alert(camera_id, plate, entry, tracker_id, class_name, thumbnail_jpeg=None):
+def _emit_watchlist_alert(camera_id, plate, entry, tracker_id, class_name, thumbnail_jpeg=None,
+                          event_ts=None):
     """Persist a watchlist_match event and broadcast its alert — the single
     shared path used by both the live pipeline (CameraWorker._on_watchlist_match)
     and the /api/watchlist/simulate demo hook. Reuses the same DB +
     WebSocket transport as zone alerts; only the trigger/type differs."""
-    event_ts = time.time()
+    event_ts = event_ts if event_ts is not None else time.time()
     severity = entry.get("severity") or "critical"
     label = entry.get("label") or "watchlisted vehicle"
     title = f"WATCHLIST MATCH — {plate}"
@@ -190,10 +218,7 @@ def _emit_watchlist_alert(camera_id, plate, entry, tracker_id, class_name, thumb
         "license_plate": plate,
         "type": "watchlist_match",
     }
-    try:
-        _alert_queue.put_nowait(alert)
-    except queue.Full:
-        pass
+    _publish_alert(alert)
     return event_id
 
 
@@ -222,6 +247,10 @@ class CameraWorker:
 
     def stop(self):
         self.stop_requested = True
+        # Wake a source that is blocked in a read or a reconnect backoff.
+        source = getattr(self.pipeline, "source", None)
+        if hasattr(source, "stop"):
+            source.stop()
         if self.thread:
             self.thread.join(timeout=5)
 
@@ -245,29 +274,52 @@ class CameraWorker:
             return
 
         self.pipeline = pipeline
-        pipeline.stream(
-            on_frame=self._on_frame,
-            on_event=self._on_event,
-            on_watchlist=self._on_watchlist_match,
-            on_analytic=self._on_analytic,
-            loop=True,
-            target_fps=STREAM_FPS,
-            stop_flag=lambda: self.stop_requested,
-            night_vision_flag=lambda: self.thermal_enabled,
-        )
+        try:
+            pipeline.stream(
+                on_frame=self._on_frame,
+                on_event=self._on_event,
+                on_watchlist=self._on_watchlist_match,
+                on_analytic=self._on_analytic,
+                loop=True,
+                target_fps=STREAM_FPS,
+                stop_flag=lambda: self.stop_requested,
+                night_vision_flag=lambda: self.thermal_enabled,
+            )
+        finally:
+            # Close the capture so the gateway stops sending us a stream copy.
+            source = getattr(pipeline, "source", None)
+            if hasattr(source, "release"):
+                source.release()
+
+    def _event_ts(self) -> float:
+        """Wall-clock time of the frame being processed, derived from its PTS."""
+        ts = getattr(self.pipeline, "frame_ts_epoch", None)
+        return ts if ts is not None else time.time()
+
+    def stream_stats(self) -> dict | None:
+        """Live transport stats (reconnects, measured PTS fps, codec,
+        resolution, dropped frames, scene resets) for the health view."""
+        source = getattr(self.pipeline, "source", None)
+        stats = source.stats() if hasattr(source, "stats") else None
+        if stats is None:
+            return None
+        stats["scene_resets"] = getattr(self.pipeline, "scene_resets", 0)
+        stats["last_scene_reset"] = getattr(self.pipeline, "last_scene_reset", None)
+        return stats
 
     def health(self) -> dict:
         """Latest camera tampering/health status (Phase 6.1), or unknown."""
         st = getattr(self.pipeline, "tamper_status", None)
+        stream = self.stream_stats()
         if not st:
-            return {"state": "unknown", "issue": None, "healthy": None, "metrics": {}}
+            return {"state": "unknown", "issue": None, "healthy": None, "metrics": {}, "stream": stream}
         return {"state": st.get("state"), "issue": st.get("issue"),
-                "healthy": st.get("healthy"), "metrics": st.get("metrics", {})}
+                "healthy": st.get("healthy"), "metrics": st.get("metrics", {}), "stream": stream}
 
     def _on_analytic(self, ev, annotated_bgr):
         """Phase 6 analytic events (tampering / behavior / weapon / face) →
         history + WebSocket alert, reusing the same transport as everything else."""
-        event_ts = time.time()
+        event_ts = self._event_ts()
         severity = ev.get("severity", "warning")
         title = ev.get("title", "ANALYTIC EVENT")
         description = ev.get("description", "")
@@ -294,10 +346,7 @@ class CameraWorker:
             "timestamp": datetime.fromtimestamp(event_ts).strftime("%H:%M:%S"),
             "type": ev.get("type"),
         }
-        try:
-            _alert_queue.put_nowait(alert)
-        except queue.Full:
-            pass
+        _publish_alert(alert)
         return event_id
 
     def _on_frame(self, annotated_bgr):
@@ -309,8 +358,9 @@ class CameraWorker:
     def _on_event(self, evt, class_name, annotated_bgr):
         # One authoritative timestamp for this event, read ONCE and shared by
         # the DB row and the live alert below, so the audit record and the
-        # broadcast can't disagree about when the event happened.
-        event_ts = time.time()
+        # broadcast can't disagree about when the event happened. Taken from
+        # the frame's PTS (anchored to wall-clock), not from arrival time.
+        event_ts = self._event_ts()
         if evt.event_type == ZoneEventType.CLIMBING:
             severity = "critical"
             title = f"{class_name.upper()} CLIMBING DETECTED"
@@ -364,16 +414,14 @@ class CameraWorker:
             "timestamp": datetime.fromtimestamp(event_ts).strftime("%H:%M:%S"),
             "license_plate": license_plate,
         }
-        try:
-            _alert_queue.put_nowait(alert)
-        except queue.Full:
-            pass  # drop rather than block the CV thread if nobody's draining it
+        _publish_alert(alert)
 
     def _on_watchlist_match(self, match, annotated_bgr):
         """Fires when a plate read off this camera's feed matches an active
         watchlist entry. Delegates to the shared emitter so the live-pipeline
         path and the /api/watchlist/simulate demo hook stay identical."""
         return _emit_watchlist_alert(
+            event_ts=self._event_ts(),
             camera_id=self.camera_id,
             plate=match["plate"],
             entry=match["entry"],
@@ -471,7 +519,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -517,13 +565,61 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class UserCreateRequest(BaseModel):
+    username: str
+    password: str
+    role: str
+    department: str
+    display_name: str | None = None
+
+
+class UserUpdateRequest(BaseModel):
+    password: str | None = None
+    role: str | None = None
+    department: str | None = None
+    display_name: str | None = None
+
+
+def _login_key(request: Request, username: str) -> str:
+    forwarded = request.headers.get("x-forwarded-for", "")
+    ip = forwarded.split(",", 1)[0].strip() or (request.client.host if request.client else "unknown")
+    return f"{ip}:{username.lower()}"
+
+
+def _login_blocked(key: str) -> bool:
+    cutoff = time.time() - LOGIN_RATE_LIMIT_WINDOW_S
+    with _login_failures_lock:
+        failures = [ts for ts in _login_failures.get(key, []) if ts >= cutoff]
+        _login_failures[key] = failures
+        return len(failures) >= LOGIN_RATE_LIMIT_MAX_FAILURES
+
+
+def _record_login_failure(key: str) -> None:
+    cutoff = time.time() - LOGIN_RATE_LIMIT_WINDOW_S
+    with _login_failures_lock:
+        failures = [ts for ts in _login_failures.get(key, []) if ts >= cutoff]
+        failures.append(time.time())
+        _login_failures[key] = failures
+
+
+def _clear_login_failures(key: str) -> None:
+    with _login_failures_lock:
+        _login_failures.pop(key, None)
+
+
 @app.post("/api/auth/login")
-def login(body: LoginRequest):
+def login(body: LoginRequest, request: Request):
     username = body.username.strip()
+    key = _login_key(request, username)
+    if _login_blocked(key):
+        audit_store.log(username, None, "login_rate_limited")
+        return _error("Too many failed login attempts. Try again later.", status_code=429)
     user = auth_store.verify_login(username, body.password)
     if user is None:
+        _record_login_failure(key)
         audit_store.log(username, None, "login_failed", detail="bad credentials")
         return _error("Invalid username or password.", status_code=401)
+    _clear_login_failures(key)
     session = auth_store.create_session(user["username"])
     audit_store.log(user["username"], user["role"], "login")
     return {"token": session["token"], "expires_at": session["expires_at"], "user": user}
@@ -546,6 +642,86 @@ def get_users(user: dict = Depends(require_admin)):
     return {"users": auth_store.list_users()}
 
 
+@app.post("/api/users")
+def create_user(body: UserCreateRequest, user: dict = Depends(require_admin)):
+    try:
+        created = auth_store.add_user(
+            body.username, body.password, body.role, body.department, body.display_name
+        )
+    except ValueError as exc:
+        status = 409 if "already exists" in str(exc) else 400
+        return _error(str(exc), status_code=status)
+    audit_store.log(user["username"], user["role"], "user_create", target=created["username"])
+    return JSONResponse(status_code=201, content=created)
+
+
+@app.put("/api/users/{username}")
+def update_user(username: str, body: UserUpdateRequest, user: dict = Depends(require_admin)):
+    try:
+        updated = auth_store.update_user(
+            username,
+            password=body.password,
+            role=body.role,
+            department=body.department,
+            display_name=body.display_name,
+        )
+    except ValueError as exc:
+        return _error(str(exc), status_code=400)
+    if updated is None:
+        return _error(f"No user '{username}'.", status_code=404)
+    audit_store.log(user["username"], user["role"], "user_update", target=updated["username"])
+    return updated
+
+
+@app.delete("/api/users/{username}")
+def delete_user(username: str, user: dict = Depends(require_admin)):
+    if username == user.get("username"):
+        return _error("Admins cannot delete their own active account.", status_code=400)
+    if not auth_store.delete_user(username):
+        return _error(f"No user '{username}'.", status_code=404)
+    audit_store.log(user["username"], user["role"], "user_delete", target=username)
+    return {"deleted": username}
+
+
+class GatewaySyncIn(BaseModel):
+    apply_active: bool = False  # re-apply IBVAP_GATEWAY_ACTIVE to existing rows
+
+
+@app.post("/api/gateway/sync")
+def sync_gateway(body: GatewaySyncIn | None = None, user: dict = Depends(require_admin)):
+    """Re-read the live gateway catalogue (cameras.json / /api/ingest) into the
+    Camera Registry and start/stop workers to match. Admin only."""
+    if not gateway.catalog_configured():
+        return _error("IBVAP_GATEWAY_CATALOG is not configured.", status_code=400)
+    try:
+        result = gateway.sync_from_gateway(apply_active=bool(body and body.apply_active))
+    except PermissionError as exc:
+        return _error(str(exc), status_code=502)
+    except Exception as exc:
+        return _error(f"Gateway catalogue sync failed: {exc}", status_code=502)
+    _reconcile_workers(result["added"] + result["updated"] + result["removed"])
+    audit_store.log(user["username"], user["role"], "gateway_sync",
+                    detail=f"total={result['total']} active={','.join(result['active'])}")
+    return result
+
+
+@app.get("/api/gateway/catalog")
+def gateway_catalog(user: dict = Depends(require_operator)):
+    """The last catalogue read (per-camera codec / resolution / live status /
+    URLs, credential-free) plus live transport stats for running workers."""
+    cat = gateway.last_catalog()
+    visible = {c["id"] for c in _visible_cameras(user)}
+    cams = []
+    for entry in cat["cameras"]:
+        if entry["id"] not in visible:
+            continue
+        worker = _cameras.get(entry["id"])
+        cams.append({**entry, "processing": bool(worker and worker.is_alive()),
+                     "stream": worker.stream_stats() if worker else None})
+    return {"configured": gateway.catalog_configured(), "source": cat["source"],
+            "fetched_at": cat["fetched_at"], "error": cat["error"], "cameras": cams}
+
+
 @app.on_event("startup")
 def _startup():
     history_store.init_db()
@@ -554,8 +730,20 @@ def _startup():
     route_store.init_db()
     auth_store.init_db()
     audit_store.init_db()
-    auth_store.seed_users()
-    camera_store.seed_defaults(_DEFAULT_CAMERAS)
+    if SEED_DEMO_USERS:
+        auth_store.seed_users()
+    if gateway.catalog_configured():
+        # The live gateway catalogue is the contract: the registry mirrors it
+        # (no demo webcam/clip seeds on a fresh DB).
+        try:
+            result = gateway.sync_from_gateway()
+            print(f"[gateway] catalogue synced: {result['total']} cameras, "
+                  f"processing {result['active']}")
+        except Exception as exc:
+            print(f"[gateway] catalogue sync failed (continuing with registry as-is): {exc}")
+        _start_gateway_resync_thread()
+    else:
+        camera_store.seed_defaults(_DEFAULT_CAMERAS)
     with _cameras_lock:
         for cam in camera_store.list_cameras():
             try:
@@ -564,8 +752,47 @@ def _startup():
                 print(f"[{cam['id']}] failed to start on boot: {exc}")
 
 
+GATEWAY_RESYNC_INTERVAL_S = float(os.environ.get("IBVAP_GATEWAY_RESYNC_INTERVAL_S", "300"))
+_gateway_stop = threading.Event()
+
+
+def _reconcile_workers(camera_ids):
+    """Bring workers in line with registry rows the gateway sync touched:
+    start/restart enabled cameras whose source changed, stop disabled ones."""
+    with _cameras_lock:
+        for camera_id in camera_ids:
+            cam = camera_store.get_camera(camera_id)
+            worker = _cameras.get(camera_id)
+            if cam is None or _runnable_source(cam) is None:
+                _stop_worker(camera_id)
+            elif worker is None or not worker.is_alive() or worker.source != _runnable_source(cam):
+                _start_worker(cam)
+
+
+def _start_gateway_resync_thread():
+    """Periodically re-read the catalogue — camera ids and the camera set can
+    change, so the registry follows it without a restart."""
+    if GATEWAY_RESYNC_INTERVAL_S <= 0:
+        return
+
+    def loop():
+        while not _gateway_stop.wait(GATEWAY_RESYNC_INTERVAL_S):
+            try:
+                result = gateway.sync_from_gateway()
+                touched = result["added"] + result["updated"] + result["removed"]
+                if touched:
+                    _reconcile_workers(touched)
+                    print(f"[gateway] resync: +{len(result['added'])} "
+                          f"~{len(result['updated'])} -{len(result['removed'])}")
+            except Exception as exc:
+                print(f"[gateway] resync failed: {exc}")
+
+    threading.Thread(target=loop, name="gateway-resync", daemon=True).start()
+
+
 @app.on_event("shutdown")
 def _shutdown():
+    _gateway_stop.set()
     with _cameras_lock:
         for camera in list(_cameras.values()):
             camera.stop()
@@ -642,10 +869,50 @@ def _to_bool(v, default=True):
     return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
 
 
+def _validate_source_spec(source_spec: str | None):
+    """Reject obvious server-side request forgery targets before a worker
+    later hands a source URL to OpenCV/ONVIF."""
+    if not source_spec:
+        return None
+    spec = source_spec.strip()
+    parsed = urlparse(spec)
+    if parsed.scheme in ("http", "https", "rtsp", "rtsps", "onvif"):
+        host = (parsed.hostname or "").lower()
+        if host in ("localhost", "127.0.0.1", "::1", "0.0.0.0") or host.startswith("169.254."):
+            return "Camera source cannot target loopback/link-local hosts."
+        if re.match(r"^10\.", host) or re.match(r"^192\.168\.", host):
+            return None
+        if re.match(r"^172\.(1[6-9]|2\d|3[0-1])\.", host):
+            return None
+    return None
+
+
 def _visible_cameras(user: dict) -> list[dict]:
     """Registry rows the user's department is allowed to see (admins see all)."""
     return [c for c in camera_store.list_cameras()
             if auth_store.can_access_department(user, c.get("department"))]
+
+
+def _visible_camera_ids(user: dict) -> list[str] | None:
+    """None means unscoped admin; list means the caller's department cameras."""
+    if user.get("department") == auth_store.ALL_DEPARTMENTS:
+        return None
+    return [c["id"] for c in _visible_cameras(user)]
+
+
+def _can_access_camera_id(user: dict, camera_id: str | None) -> bool:
+    if not camera_id:
+        return False
+    if user.get("department") == auth_store.ALL_DEPARTMENTS:
+        return True
+    cam = camera_store.get_camera(camera_id)
+    return cam is not None and auth_store.can_access_department(user, cam.get("department"))
+
+
+def _demo_hooks_available():
+    if not DEMO_HOOKS_ENABLED:
+        return _error("Demo injection hooks are disabled.", status_code=404)
+    return None
 
 
 @app.get("/api/cameras")
@@ -688,6 +955,9 @@ def create_camera(body: CameraIn, user: dict = Depends(require_operator)):
     camera_id = (body.id or "").strip() or _next_camera_id()
     fields = body.model_dump(exclude_none=True)
     fields.pop("id", None)
+    source_error = _validate_source_spec(fields.get("source_spec"))
+    if source_error:
+        return _error(source_error, status_code=400)
     try:
         cam = camera_store.add_camera(camera_id, fields)
     except ValueError as exc:
@@ -708,6 +978,9 @@ def update_camera(camera_id: str, body: CameraIn, user: dict = Depends(require_o
 
     fields = body.model_dump(exclude_none=True)
     fields.pop("id", None)
+    source_error = _validate_source_spec(fields.get("source_spec"))
+    if source_error:
+        return _error(source_error, status_code=400)
     cam = camera_store.update_camera(camera_id, fields)
 
     # Restart the worker only when something that affects streaming changed.
@@ -738,6 +1011,8 @@ def import_cameras(body: CsvImport, user: dict = Depends(require_operator)):
     """Bulk-onboard cameras from CSV text. Columns (header row required):
     id,name,department,lat,lon,source_spec,ownership,storage_details,enabled.
     id is optional (auto-assigned); duplicate ids are skipped, not errored."""
+    if len((body.csv or "").encode("utf-8")) > MAX_CSV_IMPORT_BYTES:
+        return _error(f"CSV import is too large (max {MAX_CSV_IMPORT_BYTES} bytes).", status_code=413)
     reader = csv.DictReader(io.StringIO(body.csv))
     added, skipped, errors = [], [], []
     to_start = []
@@ -753,6 +1028,10 @@ def import_cameras(body: CsvImport, user: dict = Depends(require_operator)):
             "storage_details": row.get("storage_details"),
             "enabled": _to_bool(row.get("enabled"), default=True),
         }
+        source_error = _validate_source_spec(fields.get("source_spec"))
+        if source_error:
+            errors.append({"line": line_no, "error": source_error})
+            continue
         try:
             cam = camera_store.add_camera(cam_id, {k: v for k, v in fields.items() if v is not None})
             added.append(cam["id"])
@@ -830,6 +1109,11 @@ def simulate_watchlist_sighting(body: SimulateSightingIn, user: dict = Depends(r
     without a physical plate or a live OCR model installed. On a match it
     emits the same watchlist_match event + WebSocket alert the live pipeline
     would (using the camera's latest frame as the thumbnail if it's live)."""
+    disabled = _demo_hooks_available()
+    if disabled:
+        return disabled
+    if not _can_access_camera_id(user, body.camera_id):
+        return _error("Not authorized for this camera's department.", status_code=403)
     entry = watchlist.check_plate(body.plate)
     norm = watchlist.normalize_plate(body.plate)
     if entry is None:
@@ -876,6 +1160,11 @@ def inject_sighting(body: SightingIn, user: dict = Depends(require_operator)):
     `plate` — lets a multi-camera route be demonstrated without a live OCR
     model. (The live pipeline records these automatically, with real
     appearance embeddings for Re-ID fusion.)"""
+    disabled = _demo_hooks_available()
+    if disabled:
+        return disabled
+    if not _can_access_camera_id(user, body.camera_id):
+        return _error("Not authorized for this camera's department.", status_code=403)
     tracker_id = body.tracker_id if body.tracker_id is not None else int(time.time() * 1000) % 100000
     route_store.record_sighting(
         camera_id=body.camera_id,
@@ -1084,21 +1373,30 @@ def stream(camera_id: str, user: dict = Depends(current_user)):
 
 @app.websocket("/ws/alerts")
 async def ws_alerts(websocket: WebSocket):
-    # The alert feed carries data across all cameras, so require a valid
-    # session (passed as ?token= since a WebSocket can't set headers).
-    if auth_store.get_session_user(websocket.query_params.get("token")) is None:
+    # The alert feed carries live camera ids, so authenticate and scope each
+    # alert to the caller's department.
+    user = auth_store.get_session_user(websocket.query_params.get("token"))
+    if user is None:
         await websocket.close(code=1008)  # policy violation
         return
+    subscriber: "queue.Queue[dict]" = queue.Queue(maxsize=200)
+    with _alert_subscribers_lock:
+        _alert_subscribers.append(subscriber)
     await websocket.accept()
     try:
         while True:
             try:
-                alert = _alert_queue.get_nowait()
-                await websocket.send_text(json.dumps(alert))
+                alert = subscriber.get_nowait()
+                if _can_access_camera_id(user, alert.get("camera")):
+                    await websocket.send_text(json.dumps(alert))
             except queue.Empty:
                 await asyncio.sleep(0.2)
     except WebSocketDisconnect:
         pass
+    finally:
+        with _alert_subscribers_lock:
+            if subscriber in _alert_subscribers:
+                _alert_subscribers.remove(subscriber)
 
 
 # --- Event history --------------------------------------------------------
@@ -1141,14 +1439,23 @@ def get_history(
     limit = max(1, min(limit, MAX_HISTORY_LIMIT))
     offset = max(0, offset)
     cam, sev, since_epoch = _history_filters(camera_id, severity, since_hours)
+    if cam and not _can_access_camera_id(user, cam):
+        return _error("Not authorized for this camera's department.", status_code=403)
+    camera_ids = None if cam else _visible_camera_ids(user)
     rows, total = history_store.query_events(
-        camera_id=cam, severity=sev, since_epoch=since_epoch, limit=limit, offset=offset
+        camera_id=cam, camera_ids=camera_ids, severity=sev, since_epoch=since_epoch,
+        limit=limit, offset=offset
     )
     return {"events": [_serialize_event(r) for r in rows], "total": total}
 
 
 @app.get("/api/history/thumbnail/{event_id}")
 def get_history_thumbnail(event_id: int, user: dict = Depends(current_user)):
+    row = history_store.get_event(event_id)
+    if row is None:
+        return _error(f"No event with id {event_id}.", status_code=404)
+    if not _can_access_camera_id(user, row.get("camera_id")):
+        return _error("Not authorized for this event's department.", status_code=403)
     path = history_store.get_thumbnail_path(event_id)
     if path is None:
         return _error(f"No thumbnail stored for event {event_id}.", status_code=404)
@@ -1165,6 +1472,8 @@ def explain_history_event(event_id: int, user: dict = Depends(require_operator))
     row = history_store.get_event(event_id)
     if row is None:
         return _error(f"No event with id {event_id}.", status_code=404)
+    if not _can_access_camera_id(user, row.get("camera_id")):
+        return _error("Not authorized for this event's department.", status_code=403)
 
     if row.get("explanation"):
         return {"explanation": row["explanation"], "cached": True}
@@ -1203,8 +1512,12 @@ def export_history_csv(
     user: dict = Depends(require_operator),
 ):
     cam, sev, since_epoch = _history_filters(camera_id, severity, since_hours)
+    if cam and not _can_access_camera_id(user, cam):
+        return _error("Not authorized for this camera's department.", status_code=403)
+    camera_ids = None if cam else _visible_camera_ids(user)
     rows, _total = history_store.query_events(
-        camera_id=cam, severity=sev, since_epoch=since_epoch, limit=5000, offset=0
+        camera_id=cam, camera_ids=camera_ids, severity=sev, since_epoch=since_epoch,
+        limit=5000, offset=0
     )
 
     buf = io.StringIO()
@@ -1229,7 +1542,8 @@ def analytics_summary(since_hours: float | None = None, user: dict = Depends(cur
     health — this is what the Analytics dashboard renders instead of mock data.
     Scoped to the caller's department (admins see all)."""
     since_epoch = time.time() - since_hours * 3600 if since_hours else None
-    stats = history_store.summary_stats(since_epoch=since_epoch)
+    visible_ids = _visible_camera_ids(user)
+    stats = history_store.summary_stats(since_epoch=since_epoch, camera_ids=visible_ids)
 
     cams = _visible_cameras(user)
     by_conn = {"online": 0, "offline": 0, "disabled": 0, "no-source": 0}
@@ -1263,8 +1577,9 @@ def generate_analytics_report(user: dict = Depends(current_user)):
 
     NL = {"new_x": XPos.LMARGIN, "new_y": YPos.NEXT}  # shorthand for "cell, then newline"
 
-    stats = history_store.summary_stats()
-    recent_rows, _total = history_store.query_events(limit=100, offset=0)
+    visible_ids = _visible_camera_ids(user)
+    stats = history_store.summary_stats(camera_ids=visible_ids)
+    recent_rows, _total = history_store.query_events(camera_ids=visible_ids, limit=100, offset=0)
 
     pdf = FPDF()
     pdf.set_auto_page_break(auto=True, margin=15)
@@ -1341,6 +1656,7 @@ from fastapi.routing import APIRoute as _APIRoute  # noqa: E402
 _TAG_BY_PREFIX = [
     ("/api/auth", "Auth"), ("/api/users", "Auth"),
     ("/api/stream", "Cameras"), ("/api/thermal", "Cameras"), ("/api/cameras", "Cameras"),
+    ("/api/gateway", "Cameras"),
     ("/api/zones", "Zones"),
     ("/api/watchlist", "Watchlist"),
     ("/api/route", "Route Reconstruction"),

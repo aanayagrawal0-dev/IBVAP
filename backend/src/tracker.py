@@ -23,7 +23,11 @@ REID_INTERVAL = 20
 
 class Tracker:
     def __init__(self, frame_rate=25, enable_reid=True, camera_id="cam0"):
+        self._frame_rate = frame_rate
         self.tracker = sv.ByteTrack(frame_rate=frame_rate)
+        # Added to ByteTrack's ids so they stay unique across reset().
+        self._id_offset = 0
+        self._max_id_seen = 0
         # tracker_id -> list of (frame_idx, cx, cy) centroid history
         self.history = {}
         self.max_history = 90  # ~3-4s of trajectory at typical frame rates
@@ -45,6 +49,18 @@ class Tracker:
             self._registry = GlobalTargetRegistry(similarity_threshold=0.70)
             logger.info("Re-ID enabled for camera %s", camera_id)
 
+    def reset(self):
+        """Drop all per-track state after a scene discontinuity (feed loop
+        point, reconnect, PTS jump) so no track survives a hard cut. Local ids
+        keep increasing past the old ones, so state other stages keyed on an
+        old id (zones, behavior) is never inherited by a new object."""
+        self._id_offset = self._max_id_seen
+        self.tracker = sv.ByteTrack(frame_rate=self._frame_rate)
+        self.history.clear()
+        self._global_id_cache.clear()
+        self._embedding_cache.clear()
+        self._last_reid_frame.clear()
+
     @classmethod
     def with_shared_registry(cls, registry: GlobalTargetRegistry,
                              frame_rate=25, camera_id="cam0"):
@@ -65,6 +81,10 @@ class Tracker:
                         skip Re-ID even if enabled.
         """
         tracked = self.tracker.update_with_detections(detections)
+        if len(tracked) and tracked.tracker_id is not None:
+            if self._id_offset:
+                tracked.tracker_id = tracked.tracker_id + self._id_offset
+            self._max_id_seen = max(self._max_id_seen, int(tracked.tracker_id.max()))
 
         global_ids = np.full(len(tracked), -1, dtype=np.int64)
 

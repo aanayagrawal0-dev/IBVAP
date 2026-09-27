@@ -11,7 +11,7 @@ export interface RegistryCamera {
   department: string | null;
   lat: number | null;
   lon: number | null;
-  camera_type: string; // webcam | rtsp | onvif | mjpeg | file | none
+  camera_type: string; // webcam | rtsp | hls | onvif | mjpeg | file | none
   ownership: string | null;
   source_spec: string | null;
   status: string;
