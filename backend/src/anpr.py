@@ -27,7 +27,16 @@ class ANPREngine:
         self.enabled = False
         try:
             from paddleocr import PaddleOCR
-            self.ocr = PaddleOCR(use_angle_cls=False, lang="en", show_log=False)
+            # Document-level stages off (we feed small vehicle crops, not
+            # scanned pages). oneDNN off: PaddlePaddle 3.3 on Windows CPU
+            # crashes in the text detector with it enabled.
+            self.ocr = PaddleOCR(
+                lang="en",
+                use_doc_orientation_classify=False,
+                use_doc_unwarping=False,
+                use_textline_orientation=False,
+                enable_mkldnn=False,
+            )
             self.enabled = True
         except Exception as e:
             print(
@@ -48,12 +57,13 @@ class ANPREngine:
                 return None
 
             processed = self._preprocess(crop)
-            result = self.ocr.ocr(processed, cls=False)
-
-            if not result or not result[0]:
+            # The OCR pipeline expects a 3-channel image.
+            result = self.ocr.predict(cv2.cvtColor(processed, cv2.COLOR_GRAY2BGR))
+            if not result:
                 return None
 
-            return self._best_plate(result[0])
+            return self._best_plate(result[0].get("rec_texts") or [],
+                                    result[0].get("rec_scores") or [])
         except Exception:
             return None  # never interrupt the pipeline
 
@@ -76,13 +86,12 @@ class ANPREngine:
         return clahe.apply(gray)
 
     @staticmethod
-    def _best_plate(lines) -> str | None:
+    def _best_plate(texts, scores) -> str | None:
         """Pick the highest-confidence line, clean it, and return it if it
         has at least 4 alphanumeric chars (shortest real plate length)."""
         best_text, best_conf = None, 0.0
-        for line in lines:
-            text_block = line[1]  # (bbox, (text, conf))
-            raw_text, conf = text_block[0], text_block[1]
+        for raw_text, conf in zip(texts, scores):
+            conf = float(conf)
             if conf >= _MIN_CONF and conf > best_conf:
                 cleaned = _PLATE_RE.sub("", raw_text.upper())
                 if len(cleaned) >= 4:

@@ -1,5 +1,5 @@
 ultralytics>=8.2.0
-opencv-python>=4.9.0
+opencv-python==4.10.0.84  # matches paddlex's opencv-contrib-python pin
 supervision>=0.21.0
 numpy>=1.26.0
 fastapi>=0.115.0
@@ -11,5 +11,5 @@ requests>=2.31.0
 onvif-zeep>=0.2.12
 torch>=2.0.0
 torchvision>=0.15.0
-paddlepaddle>=2.6.0
-paddleocr>=2.7.0
+paddlepaddle>=3.0.0
+paddleocr>=3.0.0
