@@ -5,6 +5,8 @@ import { Plus, Save, X, Trash2, AlertTriangle, CheckCircle2 } from "lucide-react
 import { cn } from "@/lib/utils";
 import { fetchCameraOptions, FALLBACK_CAMERAS, type CameraOption } from "@/lib/cameras";
 import { getZones, saveZones, type Point, type ZoneDef } from "@/lib/zones";
+import { API_BASE } from "@/lib/config";
+import { withToken } from "@/lib/auth";
 
 const ZONE_COLORS = [
   "#FF5C00", // safety orange
@@ -339,14 +341,21 @@ export default function ZoneConfigPage() {
             onMouseUp={() => setDragIndex(null)}
             onMouseLeave={() => setDragIndex(null)}
             className={cn(
-              "relative aspect-video w-full overflow-hidden rounded-lg border border-obsidian-border",
+              "relative aspect-video w-full overflow-hidden rounded-lg border border-obsidian-border bg-obsidian-950",
               adding ? "cursor-crosshair" : "cursor-default"
             )}
-            style={{
-              background:
-                "linear-gradient(180deg, #3a2f2a 0%, #6b4a35 35%, #8a5a3a 48%, #2a1f1a 60%, #14100d 100%)",
-            }}
           >
+            {/* Live Camera Feed Background */}
+            <img
+              src={withToken(`${API_BASE}/api/stream/${cameraId}`)}
+              alt={`Live feed background for ${cameraId}`}
+              className="absolute inset-0 h-full w-full object-cover opacity-80"
+              onError={(e) => {
+                // Hide broken image icon if stream/backend is offline
+                (e.target as HTMLElement).style.display = "none";
+              }}
+            />
+
             <svg
               className="absolute inset-0 h-full w-full"
               viewBox="0 0 100 100"

@@ -20,7 +20,7 @@ import os
 
 # Keep this on a stable Flash model from the Gemini API model catalog.
 # Override via GEMINI_MODEL without touching code if this default goes stale.
-DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
 
 _PROMPT_TEMPLATE = """You are an assistant embedded in IBVAP, an AI border-security video \
 analytics system. Below is one automatically detected event from a computer-vision pipeline \

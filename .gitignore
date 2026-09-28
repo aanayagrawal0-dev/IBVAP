@@ -8,6 +8,8 @@ venv/
 # Env / secrets
 .env
 backend/.env
+.env*.local
+*.env.local
 
 # Model weights
 *.pt
