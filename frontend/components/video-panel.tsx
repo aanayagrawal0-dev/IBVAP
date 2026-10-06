@@ -97,11 +97,31 @@ function PlaceholderScene() {
   );
 }
 
+/** Plain-language reason a live feed has no picture yet, or null if frames
+ * are arriving. Driven by the backend's per-camera stream stats. */
+function noPictureMessage(t: {
+  framesShown?: number; frameAgeS?: number | null; buffering?: boolean; lastError?: string | null;
+}): string | null {
+  const receiving = (t.framesShown ?? 0) > 0 && (t.frameAgeS ?? 0) < 5;
+  if (receiving) return null;
+  const err = (t.lastError ?? "").toLowerCase();
+  if (err.includes("watch time limit"))
+    return "Gateway: watch time limit reached for this account — waiting for the cooldown. Try again later.";
+  if (err.includes("login") || err.includes("cookie"))
+    return "Gateway login expired — put a fresh portal cookie in IBVAP_HLS_COOKIE (backend/.env) and restart the backend.";
+  if (err.includes("401"))
+    return "Gateway rejected the credentials (401) — check the email / access password in backend/.env.";
+  if (t.lastError) return `Can't reach the camera yet — retrying. (${t.lastError})`;
+  if (t.buffering || (t.framesShown ?? 0) === 0) return "Buffering the live feed… (usually 6–10 seconds)";
+  return "Waiting for the camera…";
+}
+
 export function VideoPanel({
   cameraId,
   cameraLabel,
   timestamp,
   streamUrl,
+  aiActive = true,
 }: {
   /** Which camera this panel is showing, e.g. "CAM-01" — used to hit that
    * camera's own /api/thermal/{cameraId} endpoint. Each camera has fully
@@ -112,11 +132,50 @@ export function VideoPanel({
   /** MJPEG endpoint, e.g. http://localhost:8000/api/stream/CAM-01. Omit or
    * let it fail to load and this falls back to the placeholder scene. */
   streamUrl?: string;
+  /** False in camera-test mode: the feed is shown without AI overlays. */
+  aiActive?: boolean;
 }) {
   const [streamFailed, setStreamFailed] = useState(false);
   const [thermalOn, setThermalOn] = useState(false);
   const [thermalPending, setThermalPending] = useState(false);
   const showRealStream = Boolean(streamUrl) && !streamFailed;
+  // Real telemetry from the backend (GET /api/cameras/{id}), not placeholders.
+  const [telemetry, setTelemetry] = useState<{
+    displayFps?: number; aiFps?: number; codec?: string | null; res?: string | null;
+    lat?: number | null; lon?: number | null;
+    framesShown?: number; frameAgeS?: number | null; buffering?: boolean; lastError?: string | null;
+  } | null>(null);
+
+  useEffect(() => {
+    if (!showRealStream) return;
+    let cancelled = false;
+    const poll = () =>
+      apiFetch(`${API_BASE}/api/cameras/${encodeURIComponent(cameraId)}`)
+        .then((res) => (res.ok ? res.json() : null))
+        .then((cam) => {
+          if (cancelled || !cam) return;
+          const st = cam.health?.stream;
+          setTelemetry({
+            displayFps: st?.display_fps,
+            aiFps: st?.ai_fps,
+            codec: st?.codec,
+            res: st?.width && st?.height ? `${st.width}x${st.height}` : null,
+            lat: cam.lat,
+            lon: cam.lon,
+            framesShown: st?.frames_delivered,
+            frameAgeS: st?.last_frame_age_s,
+            buffering: st?.buffering,
+            lastError: st?.last_error,
+          });
+        })
+        .catch(() => {});
+    poll();
+    const id = setInterval(poll, 3000);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [showRealStream, cameraId]);
 
   // The parent also remounts this component on camera switch (key=
   // {activeCamera}), but resetting here too means this still behaves
@@ -183,6 +242,13 @@ export function VideoPanel({
         <PlaceholderScene />
       )}
 
+      {/* Why there's no picture (instead of a silent black screen) */}
+      {showRealStream && telemetry && noPictureMessage(telemetry) && (
+        <div className="absolute inset-0 flex items-center justify-center bg-obsidian-950/80 p-6 text-center">
+          <p className="max-w-md text-xs font-mono text-ink">{noPictureMessage(telemetry)}</p>
+        </div>
+      )}
+
       {/* Top overlay bar */}
       <div className="absolute inset-x-0 top-0 flex items-center justify-between p-3">
         <div className="flex items-center gap-2">
@@ -224,15 +290,22 @@ export function VideoPanel({
         </div>
       </div>
       <div className="absolute left-3 top-9 rounded bg-obsidian-950/70 px-1 py-0.5 text-[9px] font-mono text-critical backdrop-blur-sm">
-        AI-ANALYTICS: {showRealStream ? "ACTIVE" : "STANDBY"}
+        AI-ANALYTICS: {!aiActive ? "OFF (CAMERA TEST)" : showRealStream ? "ACTIVE" : "STANDBY"}
         {thermalOn && " · THERMAL: SIMULATED FALSE-COLOR"}
       </div>
 
       {/* Bottom telemetry bar */}
       <div className="absolute inset-x-0 bottom-0 flex items-center justify-between bg-obsidian-950/70 px-3 py-1.5 text-[10px] font-mono text-ink-dim backdrop-blur-sm">
-        <span>FPS: 59.9</span>
-        <span>LAT: 31.4285° N&nbsp;&nbsp;LON: 106.4719° W</span>
-        <span>SYS.TEMP: 42°C</span>
+        <span>
+          FPS: {telemetry?.displayFps ?? "—"}
+          {aiActive && telemetry?.aiFps !== undefined && ` · AI ${telemetry.aiFps}`}
+        </span>
+        <span>
+          {telemetry?.lat != null && telemetry?.lon != null
+            ? `LAT ${telemetry.lat.toFixed(4)}°  LON ${telemetry.lon.toFixed(4)}°`
+            : ""}
+        </span>
+        <span>{[telemetry?.codec?.toUpperCase(), telemetry?.res].filter(Boolean).join(" · ")}</span>
       </div>
     </div>
   );

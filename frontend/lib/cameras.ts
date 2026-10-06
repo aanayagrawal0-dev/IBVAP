@@ -18,8 +18,11 @@ export interface RegistryCamera {
   storage_details: string | null;
   enabled: boolean;
   streaming: boolean;
-  connectivity: "online" | "offline" | "disabled" | "no-source";
+  connectivity: "online" | "offline" | "disabled" | "no-source" | "standby";
   health?: CameraHealth | null;
+  snapshot_age_s?: number | null;
+  /** False in camera-test mode (IBVAP_AI_ENABLED=0): feeds shown without AI. */
+  ai_enabled?: boolean;
 }
 
 /** Phase 6.1 tampering/health status merged in by the API. */
@@ -47,6 +50,10 @@ export interface CameraOption {
   id: string;
   label: string;
   status: CameraStatus;
+  /** Streaming live (vs. standby on snapshots). */
+  live?: boolean;
+  /** AI analytics running on the live stream. */
+  ai?: boolean;
 }
 
 /** Offline safety-net so those pages still render a sensible list if the
@@ -63,7 +70,9 @@ export function toCameraOption(c: RegistryCamera): CameraOption {
   return {
     id: c.id,
     label: c.name ?? c.id,
-    status: c.connectivity === "online" ? "nominal" : "offline",
+    status: c.connectivity === "online" || c.connectivity === "standby" ? "nominal" : "offline",
+    live: c.streaming,
+    ai: c.ai_enabled ?? true,
   };
 }
 
@@ -154,4 +163,17 @@ export const CONNECTIVITY_LABEL: Record<RegistryCamera["connectivity"], string> 
   offline: "Offline",
   disabled: "Disabled",
   "no-source": "No source",
+  standby: "Standby (snapshots)",
 };
+
+/** Switch a camera to live streaming with AI (others fall back to snapshots). */
+export async function loadLiveCamera(id: string): Promise<RegistryCamera> {
+  const res = await apiFetch(`${API_BASE}/api/live/${encodeURIComponent(id)}`, { method: "POST" });
+  if (!res.ok) throw new Error(await parseError(res, `Failed to load ${id}`));
+  return res.json();
+}
+
+/** Latest still for a camera; `tick` busts the browser cache on refresh. */
+export function snapshotUrl(id: string, tick: number): string {
+  return withToken(`${API_BASE}/api/snapshot/${encodeURIComponent(id)}?t=${tick}`);
+}

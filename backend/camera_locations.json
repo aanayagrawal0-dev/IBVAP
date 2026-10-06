@@ -1,0 +1,31 @@
+{
+  "_about": "Map positions for gateway cameras, whose catalogue has names but no coordinates. Placed from the camera name; 'precision' says how exact: 'landmark' = the named junction/building, 'area' = that part of town, 'town' / 'district' = centre of the town or district. Used only when a registry row has no coordinates, so a position set in the Registry UI is never overwritten. Cameras whose name doesn't identify a place (Mohanpura, kheram, dhanori, TANKAL) are deliberately left out.",
+  "cameras": {
+    "cam01": {"match": "chiman bhai bridge", "lat": 23.0545, "lon": 72.5760, "precision": "area", "place": "Chimanbhai Patel Bridge, Ahmedabad"},
+    "cam02": {"match": "janpath", "lat": 23.0680, "lon": 72.5700, "precision": "town", "place": "Janpath, Ahmedabad (exact junction not identified)"},
+    "cam03": {"match": "o.n.g.c", "lat": 23.1075, "lon": 72.5845, "precision": "area", "place": "ONGC office, Chandkheda, Ahmedabad"},
+    "cam04": {"match": "paldi circle", "lat": 23.0125, "lon": 72.5625, "precision": "landmark", "place": "Paldi Circle, Ahmedabad"},
+    "cam05": {"match": "visat teen rasta", "lat": 23.0990, "lon": 72.5925, "precision": "landmark", "place": "Visat Teen Rasta, Ahmedabad"},
+    "cam06": {"match": "timbavadi", "lat": 21.5040, "lon": 70.4645, "precision": "area", "place": "Timbavadi Gate, Junagadh"},
+    "cam07": {"match": "gir-somnath", "lat": 20.9075, "lon": 70.3675, "precision": "town", "place": "Veraval, Gir Somnath"},
+    "cam08": {"match": "majewadi", "lat": 21.5380, "lon": 70.4530, "precision": "area", "place": "Majevadi Gate, Junagadh"},
+    "cam09": {"match": "bypass", "lat": 21.4990, "lon": 70.4400, "precision": "area", "place": "New Bypass circle, Junagadh"},
+    "cam10": {"match": "char-chowk", "lat": 21.5215, "lon": 70.4560, "precision": "area", "place": "Char Chowk Road, Junagadh"},
+    "cam11": {"match": "dolatpara", "lat": 21.5445, "lon": 70.4390, "precision": "area", "place": "Dolatpara, Junagadh"},
+    "cam12": {"match": "adalaj", "lat": 23.1665, "lon": 72.5825, "precision": "landmark", "place": "Trimandir, Adalaj toll plaza"},
+    "cam13": {"match": "cn vidhyalaya", "lat": 23.0245, "lon": 72.5540, "precision": "landmark", "place": "C.N. Vidyalaya, Ambawadi, Ahmedabad"},
+    "cam14": {"match": "delight", "lat": 23.0410, "lon": 72.5480, "precision": "town", "place": "Ahmedabad (Delight RLVD - exact junction not identified)"},
+    "cam15": {"match": "suvidha", "lat": 23.0330, "lon": 72.5410, "precision": "town", "place": "Ahmedabad (Suvidha Park - exact spot not identified)"},
+    "cam16": {"match": "visat p2", "lat": 23.1002, "lon": 72.5940, "precision": "area", "place": "Visat, Ahmedabad"},
+    "cam17": {"match": "rajkot bus port", "lat": 22.2985, "lon": 70.8015, "precision": "landmark", "place": "Rajkot Bus Port"},
+    "cam18": {"match": "rajkot cctv", "lat": 22.3039, "lon": 70.8022, "precision": "town", "place": "Rajkot"},
+    "cam19": {"match": "gandevi", "lat": 20.8130, "lon": 72.9990, "precision": "town", "place": "Khaparia, Gandevi taluka, Navsari"},
+    "cam21": {"match": "patan", "lat": 23.8493, "lon": 72.1266, "precision": "town", "place": "Patan (Dethali Char Rasta)"},
+    "cam22": {"match": "mervada", "lat": 24.1725, "lon": 72.4381, "precision": "district", "place": "Banaskantha district (Mervada - exact spot not identified)"},
+    "cam24": {"match": "dehgam", "lat": 23.1700, "lon": 72.8150, "precision": "town", "place": "Dehgam"},
+    "cam27": {"match": "bilimora", "lat": 20.7695, "lon": 72.9610, "precision": "town", "place": "Bilimora"},
+    "cam28": {"match": "bilimora", "lat": 20.7712, "lon": 72.9632, "precision": "town", "place": "Bilimora"},
+    "cam29": {"match": "bilimora", "lat": 20.7678, "lon": 72.9588, "precision": "town", "place": "Bilimora"},
+    "cam30": {"match": "gandhidham", "lat": 23.0735, "lon": 70.1320, "precision": "area", "place": "Rambaug, Gandhidham"}
+  }
+}

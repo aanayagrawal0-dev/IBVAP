@@ -15,6 +15,8 @@ Run:  python tests/test_phase6_analytics.py     (from backend/, venv active)
 """
 
 import os
+os.environ["IBVAP_SKIP_DOTENV"] = "1"  # keep the developer's real .env out of tests
+os.environ["IBVAP_ROAD_ROUTING"] = "0"  # no online routing calls from tests
 import sys
 import tempfile
 import time
@@ -152,7 +154,7 @@ class _FakePipeline:
         pass
 
     def stream(self, on_frame, on_event=None, on_watchlist=None, on_analytic=None,
-               loop=True, target_fps=None, stop_flag=None, night_vision_flag=None):
+               loop=True, target_fps=None, stop_flag=None, night_vision_flag=None, **_kwargs):
         i = 0
         while not (stop_flag and stop_flag()):
             on_frame(np.full((48, 64, 3), (i * 5) % 255, dtype=np.uint8))

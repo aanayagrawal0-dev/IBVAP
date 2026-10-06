@@ -22,6 +22,15 @@ const SOURCE_COLOR: Record<RouteStop["plate_source"], string> = {
 const PLAUSIBLE = "#22C55E";
 const IMPLAUSIBLE = "#FF3B30";
 
+function fmtDuration(sec: number) {
+  if (sec < 90) return `${Math.round(sec)} s`;
+  if (sec < 5400) return `${Math.round(sec / 60)} min`;
+  return `${(sec / 3600).toFixed(1)} h`;
+}
+
+const DEMO_BADGE =
+  '<span style="margin-left:6px;padding:0 5px;border-radius:4px;background:#F5A623;color:#08090B;font-size:10px;font-weight:700">DEMO</span>';
+
 function fmtTime(iso: string) {
   return iso.replace("T", " ");
 }
@@ -97,12 +106,28 @@ export default function RouteMapPage() {
     for (let i = 1; i < stops.length; i++) {
       const t = stops[i].transition;
       const ok = !t || t.plausible;
-      const seg = L.polyline([latlngs[i - 1], latlngs[i]], {
+      // Follow the roads when the backend has a road path for this hop.
+      const road = stops[i].road_path;
+      const seg = L.polyline(road?.points?.length ? road.points : [latlngs[i - 1], latlngs[i]], {
         color: ok ? PLAUSIBLE : IMPLAUSIBLE,
         weight: 3,
         opacity: 0.9,
         dashArray: ok ? undefined : "6,7",
       }).addTo(map);
+      if (t) {
+        seg.bindTooltip(
+          `<div style="font-family:system-ui;font-size:12px;line-height:1.5">
+             <strong>${stops[i - 1].camera_id} → ${stops[i].camera_id}</strong><br/>
+             ${road ? `${road.road_km} km by road · ` : t.distance_km != null ? `${t.distance_km} km · ` : ""}took ${fmtDuration(t.elapsed_s)}<br/>
+             <span style="color:${ok ? PLAUSIBLE : IMPLAUSIBLE};font-weight:600">${
+               ok ? "Plausible" : "Impossible"
+             }</span> — ${escapeHtml(t.reason || "")}
+           </div>`,
+          { sticky: true, direction: "top" }
+        );
+      }
+      seg.on("mouseover", () => seg.setStyle({ weight: 7, opacity: 1 }));
+      seg.on("mouseout", () => seg.setStyle({ weight: 3, opacity: 0.9 }));
       layersRef.current.push(seg);
     }
 
@@ -117,21 +142,26 @@ export default function RouteMapPage() {
           iconAnchor: [12, 12],
         }),
       });
-      marker.bindPopup(
-        `<div style="font-family:system-ui;font-size:12px;line-height:1.5">
-           <strong>#${s.seq} · ${s.camera_id}</strong> — ${escapeHtml(s.camera_name || "")}<br/>
-           ${fmtTime(s.ts_iso)}<br/>
-           ${s.plate_source === "reid" ? `Re-ID match (${s.reid_similarity})` : "Plate read (ANPR)"}
-         </div>`
-      );
+      const details = `<div style="font-family:system-ui;font-size:12px;line-height:1.5">
+           <strong>#${s.seq} · ${s.camera_id}</strong>${
+             (s.class_name || "").includes("demo") ? DEMO_BADGE : ""
+           }<br/>${escapeHtml(s.camera_name || "")}<br/>
+           Spotted ${fmtTime(s.ts_iso)}<br/>
+           ${s.plate_source === "reid" ? `Re-ID match (similarity ${s.reid_similarity})` : "Plate read (ANPR)"}
+         </div>`;
+      marker.bindTooltip(details, { direction: "top", offset: [0, -12] });
+      marker.bindPopup(details);
       marker.addTo(map);
       layersRef.current.push(marker);
     });
 
-    if (latlngs.length === 1) {
-      map.setView(latlngs[0], 13);
-    } else if (latlngs.length > 1) {
-      map.fitBounds(latlngs, { padding: [50, 50], maxZoom: 13 });
+    // Fit the whole drawn route (road paths can bulge past the stops).
+    const allPoints: [number, number][] = [...latlngs];
+    stops.forEach((s) => s.road_path?.points?.forEach((p) => allPoints.push(p)));
+    if (allPoints.length === 1) {
+      map.setView(allPoints[0], 13);
+    } else if (allPoints.length > 1) {
+      map.fitBounds(allPoints, { padding: [50, 50], maxZoom: 13 });
     }
   }, [route]);
 
