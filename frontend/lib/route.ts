@@ -25,6 +25,10 @@ export interface RouteStop {
   reid_similarity: number | null;
   sighting_id: number;
   transition: Transition | null;
+  /** e.g. "car", or "car (demo)" for seeded demo routes. */
+  class_name?: string | null;
+  /** Road path from the previous stop (null/absent: draw a straight line). */
+  road_path?: { points: [number, number][]; road_km: number } | null;
 }
 
 export interface RouteMeta {

@@ -22,6 +22,7 @@ Run with:  uvicorn src.api_server:app --reload --port 8000
 """
 
 import asyncio
+import collections
 import csv
 import io
 import json
@@ -45,7 +46,10 @@ from pydantic import BaseModel
 # vars, all of it. A shell-exported value always wins over .env (dotenv's
 # default: it never overrides a variable that's already set), so this is
 # purely a convenience — nothing breaks for anyone who prefers `export`.
-load_dotenv()
+# Test runners set IBVAP_SKIP_DOTENV=1 so a developer's real .env (gateway,
+# demo-hook settings) can't leak into them.
+if os.environ.get("IBVAP_SKIP_DOTENV") != "1":
+    load_dotenv()
 
 from src.pipeline import Pipeline
 from src.zones import Zone, ZoneManager, ZoneEventType
@@ -53,11 +57,43 @@ from src import (
     history_store, zone_store, camera_store, watchlist, route_store, route,
     auth_store, audit_store, redaction, gateway,
 )
+from src.snapshots import SnapshotService
+from src.ingestion import HlsBufferedSource, open_source
+from src.playout import PlayoutBuffer
+from src import road_paths
 
 
 # --- Config -----------------------------------------------------------
 WEIGHTS_PATH = "models/yolo11n-pose.pt"
-STREAM_FPS = 15
+# Pacing for finite sources (files). Live network streams are displayed at
+# the camera's own rate (see CameraWorker._on_display_frame).
+STREAM_FPS = float(os.environ.get("IBVAP_STREAM_FPS", "25"))
+# Displayed frames are downscaled to this width before JPEG encoding — the
+# dashboard panel is far smaller than 1080p, and encoding stays cheap at 25+ fps.
+DISPLAY_MAX_WIDTH = int(os.environ.get("IBVAP_DISPLAY_MAX_WIDTH", "1280"))
+# On-demand live mode for bandwidth-limited links: at most this many cameras
+# stream with full AI at once; other enabled cameras show snapshots refreshed
+# every IBVAP_SNAPSHOT_INTERVAL_S. 0 = every enabled camera streams.
+MAX_LIVE = int(os.environ.get("IBVAP_MAX_LIVE", "0"))
+# 0 = camera-test mode: live cameras are decoded and shown as-is, with no
+# detection/tracking/analytics (checks the feeds themselves).
+# Cameras listed here come first in the camera list (e.g. the feeds measured
+# to stream best), in this order; the rest follow by id.
+PRIORITY_CAMERAS = [c.strip() for c in os.environ.get("IBVAP_PRIORITY_CAMERAS", "").split(",") if c.strip()]
+AI_ENABLED = os.environ.get("IBVAP_AI_ENABLED", "1").lower() not in ("0", "false", "no", "off")
+# Process-ahead (portal HLS + AI): the AI analyses buffered video before it is
+# shown, capped at this rate so the GPU is never pushed harder than playback
+# needs; frames play after PLAYOUT_DELAY_S, AI stays at most AHEAD_MAX_S ahead.
+# Off by default: it only pays off with plenty of bandwidth. Without it every
+# frame is shown the moment it arrives, with the latest AI boxes drawn on it.
+PROCESS_AHEAD = os.environ.get("IBVAP_PROCESS_AHEAD", "0").lower() in ("1", "true", "yes", "on")
+AI_MAX_FPS = float(os.environ.get("IBVAP_AI_MAX_FPS", "25"))
+PLAYOUT_DELAY_S = float(os.environ.get("IBVAP_PLAYOUT_DELAY_S", "2"))
+AHEAD_MAX_S = float(os.environ.get("IBVAP_AI_AHEAD_MAX_S", "10"))
+SNAPSHOT_INTERVAL_S = float(os.environ.get("IBVAP_SNAPSHOT_INTERVAL_S", "30"))
+# On-demand mode: a live camera nobody is watching is stopped after this long,
+# so gateway watch time is only spent while someone is looking. 0 = never.
+IDLE_STOP_S = float(os.environ.get("IBVAP_IDLE_STOP_S", "60"))
 MAX_CSV_IMPORT_BYTES = int(os.environ.get("IBVAP_MAX_CSV_IMPORT_BYTES", "200000"))
 DEMO_HOOKS_ENABLED = os.environ.get("IBVAP_ENABLE_DEMO_HOOKS", "1").lower() in ("1", "true", "yes", "on")
 SEED_DEMO_USERS = os.environ.get("IBVAP_SEED_DEMO_USERS", "1").lower() in ("1", "true", "yes", "on")
@@ -117,15 +153,6 @@ _DEFAULT_CAMERAS = [
     },
 ]
 
-# Used the first time a camera has no saved zone config yet (see
-# zone_store.py / the /api/zones endpoints below). Stored/edited from the
-# frontend as percentage coordinates, same as everything else here.
-DEFAULT_ZONE_PCT = {
-    "name": "restricted-zone",
-    "polygon": [[60, 0], [100, 0], [100, 100], [60, 100]],
-}
-
-
 def _zone_from_pct(zone_pct: dict) -> Zone:
     """Build a Zone from the percentage-coordinate polygon saved/edited by
     the frontend. Zone.polygon IS percentages (0-100) — no pixel conversion
@@ -138,15 +165,9 @@ def _zone_from_pct(zone_pct: dict) -> Zone:
 
 
 def _load_zone_manager_for(camera_id: str) -> ZoneManager:
+    # No zone until an operator draws one in Zone Config — an arbitrary
+    # default region would raise meaningless intrusion alerts on real cameras.
     saved = zone_store.load_zones_for_camera(camera_id)
-    if not saved:
-        # First boot, nothing saved yet for this camera: fall back to the
-        # built-in default AND persist it immediately, so GET
-        # /api/zones/{camera_id} (and the zone-config UI) reflects what's
-        # actually being enforced instead of showing an empty list while a
-        # zone is silently live underneath it.
-        saved = [DEFAULT_ZONE_PCT]
-        zone_store.save_zones_for_camera(camera_id, saved)
     return ZoneManager(zones=[_zone_from_pct(z) for z in saved])
 
 
@@ -222,6 +243,33 @@ def _emit_watchlist_alert(camera_id, plate, entry, tracker_id, class_name, thumb
     return event_id
 
 
+class _RawFeed:
+    """Camera-test mode (IBVAP_AI_ENABLED=0): same frame contract as Pipeline
+    but frames are shown exactly as decoded — no models are loaded."""
+
+    def __init__(self, source_uri, source_name):
+        self.source = open_source(source_uri, name=source_name)
+        self.frame_ts_epoch = None
+
+    def render_display(self, frame):
+        return frame
+
+    def stream(self, on_frame, stop_flag=None, loop=True, target_fps=None, **_kwargs):
+        interval = 1.0 / target_fps if target_fps else None
+        while True:
+            for _idx, frame in self.source.frames():
+                if stop_flag and stop_flag():
+                    return
+                t0 = time.time()
+                self.frame_ts_epoch = getattr(self.source, "last_ts_epoch", None)
+                on_frame(frame)
+                if interval:
+                    time.sleep(max(0.0, interval - (time.time() - t0)))
+            if not loop or self.source.is_stream or (stop_flag and stop_flag()):
+                return
+            self.source._open()
+
+
 class CameraWorker:
     """Owns one camera's entire live pipeline: its own video capture,
     detector, tracker, zone manager, thermal toggle, and background thread.
@@ -234,7 +282,17 @@ class CameraWorker:
         self.zone_manager = _load_zone_manager_for(camera_id)
         self.thermal_enabled = False
         self.frame_lock = threading.Lock()
+        self.frame_ready = threading.Condition(self.frame_lock)
         self.latest_jpeg: bytes | None = None
+        self.frame_seq = 0
+        # True once the source's reader thread feeds us every decoded frame
+        # (display at camera rate, AI overlays drawn on top).
+        self.full_rate_display = False
+        self._fps = {"display": collections.deque(), "ai": collections.deque()}  # frame times
+        self._playout: PlayoutBuffer | None = None  # process-ahead mode only
+        self._last_item = None       # newest frame queued for playout
+        self._frame_counter = 0
+        self._deferred_ts = None     # event time while a deferred alert runs
         self.stop_requested = False
         self.thread: threading.Thread | None = None
         self.started_at = None
@@ -244,6 +302,7 @@ class CameraWorker:
         self.thread = threading.Thread(target=self._run, name=f"cam-{self.camera_id}", daemon=True)
         self.thread.start()
         self.started_at = time.time()
+        self.last_viewed = time.monotonic()  # a new live camera counts as just viewed
 
     def stop(self):
         self.stop_requested = True
@@ -265,7 +324,7 @@ class CameraWorker:
                 weights=WEIGHTS_PATH,
                 conf_threshold=0.30,
                 source_name=self.camera_id,
-            )
+            ) if AI_ENABLED else _RawFeed(self.source, self.camera_id)
         except Exception as exc:
             # A bad/missing source (e.g. no webcam attached to this
             # machine) shouldn't take the whole server down — just log and
@@ -274,27 +333,84 @@ class CameraWorker:
             return
 
         self.pipeline = pipeline
+        source = getattr(pipeline, "source", None)
+        on_event, on_watchlist, on_analytic = self._on_event, self._on_watchlist_match, self._on_analytic
+        target_fps = STREAM_FPS
+        analyze_flag = None
+        if AI_ENABLED and PROCESS_AHEAD and isinstance(source, HlsBufferedSource):
+            # Process-ahead: every buffered frame is analysed (unpaced, one by
+            # one, capped at AI_MAX_FPS) and played later at the video's rate.
+            source.pace_realtime = False
+            source.latest_frame_only = False
+            self._playout = PlayoutBuffer(self._set_jpeg, start_delay_s=PLAYOUT_DELAY_S,
+                                          max_ahead_s=AHEAD_MAX_S,
+                                          stop_flag=lambda: self.stop_requested)
+            on_event = self._deferred(self._on_event)
+            on_watchlist = self._deferred(self._on_watchlist_match)
+            on_analytic = self._deferred(self._on_analytic)
+            target_fps = AI_MAX_FPS
+            analyze_flag = self._should_analyze
+        elif getattr(source, "latest_frame_only", False):
+            source.on_decoded = self._on_display_frame
+            self.full_rate_display = True
+            target_fps = None  # AI takes the newest frame; display runs at camera rate
         try:
             pipeline.stream(
                 on_frame=self._on_frame,
-                on_event=self._on_event,
-                on_watchlist=self._on_watchlist_match,
-                on_analytic=self._on_analytic,
+                on_event=on_event,
+                on_watchlist=on_watchlist,
+                on_analytic=on_analytic,
                 loop=True,
-                target_fps=STREAM_FPS,
+                target_fps=target_fps,
+                analyze_flag=analyze_flag,
                 stop_flag=lambda: self.stop_requested,
                 night_vision_flag=lambda: self.thermal_enabled,
             )
         finally:
+            if self._playout is not None:
+                self._playout.close()
             # Close the capture so the gateway stops sending us a stream copy.
             source = getattr(pipeline, "source", None)
             if hasattr(source, "release"):
                 source.release()
 
     def _event_ts(self) -> float:
-        """Wall-clock time of the frame being processed, derived from its PTS."""
+        """Wall-clock time of the frame being processed, derived from its PTS
+        (for a deferred alert: the frame it was found on, not the AI's
+        current position)."""
+        if self._deferred_ts is not None:
+            return self._deferred_ts
         ts = getattr(self.pipeline, "frame_ts_epoch", None)
         return ts if ts is not None else time.time()
+
+    def _should_analyze(self) -> bool:
+        """Process-ahead frame budget: analyse every frame while the AI has
+        a comfortable lead; when the lead shrinks, analyse every 2nd/3rd
+        frame (the rest are drawn with the latest boxes) so the video never
+        slows down to wait for the AI."""
+        self._frame_counter += 1
+        ahead = self._playout.ahead_s()
+        if ahead >= 1.5:
+            return True
+        return self._frame_counter % (2 if ahead >= 0.6 else 3) == 0
+
+    def _deferred(self, handler):
+        """Wrap an alert handler so it runs when its frame is PLAYED."""
+        def queue(*args):
+            item, ts = self._last_item, self._event_ts()
+
+            def fire():
+                self._deferred_ts = ts
+                try:
+                    handler(*args)
+                finally:
+                    self._deferred_ts = None
+
+            if item is None:
+                fire()
+            else:
+                self._playout.defer(item, fire)
+        return queue
 
     def stream_stats(self) -> dict | None:
         """Live transport stats (reconnects, measured PTS fps, codec,
@@ -303,6 +419,11 @@ class CameraWorker:
         stats = source.stats() if hasattr(source, "stats") else None
         if stats is None:
             return None
+        stats["display_fps"] = self._rate("display")
+        stats["ai_fps"] = self._rate("ai")
+        if self._playout is not None:
+            stats["ai_ahead_s"] = self._playout.ahead_s()
+            stats["playout_stalls"] = self._playout.stalls
         stats["scene_resets"] = getattr(self.pipeline, "scene_resets", 0)
         stats["last_scene_reset"] = getattr(self.pipeline, "last_scene_reset", None)
         return stats
@@ -349,11 +470,62 @@ class CameraWorker:
         _publish_alert(alert)
         return event_id
 
+    FPS_WINDOW_S = 5.0
+
+    def _tick_fps(self, key):
+        self._fps[key].append(time.monotonic())
+
+    def _rate(self, key) -> float:
+        """Frames per second over the last FPS_WINDOW_S (not skewed by bursts)."""
+        times, cutoff = self._fps[key], time.monotonic() - self.FPS_WINDOW_S
+        while times and times[0] < cutoff:
+            times.popleft()
+        return round(len(times) / self.FPS_WINDOW_S, 1)
+
+    @staticmethod
+    def _encode(bgr) -> bytes | None:
+        h, w = bgr.shape[:2]
+        if w > DISPLAY_MAX_WIDTH:
+            bgr = cv2.resize(bgr, (DISPLAY_MAX_WIDTH, int(h * DISPLAY_MAX_WIDTH / w)),
+                             interpolation=cv2.INTER_AREA)
+        ok, buf = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        return buf.tobytes() if ok else None
+
+    def _set_jpeg(self, jpeg):
+        with self.frame_ready:
+            self.latest_jpeg = jpeg
+            self.frame_seq += 1
+            self.frame_ready.notify_all()
+        if self._playout is not None:
+            self._tick_fps("display")
+
+    def _publish(self, bgr):
+        jpeg = self._encode(bgr)
+        if jpeg is not None:
+            self._set_jpeg(jpeg)
+
+    def _on_display_frame(self, frame_bgr):
+        """Every decoded frame (reader thread): raw frame + latest AI overlay."""
+        if self.thermal_enabled or self.pipeline is None:
+            return  # night-vision frames come from the AI loop instead
+        self._publish(self.pipeline.render_display(frame_bgr))
+        self._tick_fps("display")
+
     def _on_frame(self, annotated_bgr):
-        ok, buf = cv2.imencode(".jpg", annotated_bgr, [cv2.IMWRITE_JPEG_QUALITY, 80])
-        if ok:
-            with self.frame_lock:
-                self.latest_jpeg = buf.tobytes()
+        """Every AI-processed frame (and, in process-ahead mode, every frame)."""
+        if getattr(self.pipeline, "last_frame_analyzed", True):
+            self._tick_fps("ai")
+        if self._playout is not None:
+            jpeg = self._encode(annotated_bgr)
+            if jpeg is not None:
+                pts = getattr(self.pipeline, "frame_pts_s", None) or 0.0
+                self._last_item = self._playout.push(pts, jpeg)  # blocks when far ahead
+            return
+        if self.full_rate_display and not self.thermal_enabled:
+            return  # the display hook already publishes at the camera's rate
+        self._publish(annotated_bgr)
+        if not self.full_rate_display:
+            self._tick_fps("display")
 
     def _on_event(self, evt, class_name, annotated_bgr):
         # One authoritative timestamp for this event, read ONCE and shared by
@@ -461,9 +633,11 @@ def _runnable_source(cam: dict):
     return spec.strip() if isinstance(spec, str) else spec
 
 
-def _start_worker(cam: dict) -> bool:
+def _start_worker(cam: dict, explicit: bool = False) -> bool:
     """Start (or restart) the CameraWorker for a registry row. Returns True if
-    a worker is now running for it. Caller must hold _cameras_lock."""
+    a worker is now running for it. Caller must hold _cameras_lock.
+    In on-demand mode (IBVAP_MAX_LIVE) a camera only starts when an operator
+    loads it (explicit=True) — never at boot or on a registry edit."""
     camera_id = cam["id"]
     existing = _cameras.pop(camera_id, None)
     if existing is not None:
@@ -472,6 +646,8 @@ def _start_worker(cam: dict) -> bool:
     source = _runnable_source(cam)
     if source is None:
         return False
+    if MAX_LIVE and existing is None and (not explicit or len(_cameras) >= MAX_LIVE):
+        return False  # on-demand mode: stays on standby until loaded
 
     worker = CameraWorker(camera_id, source)
     worker.start()
@@ -683,6 +859,75 @@ def delete_user(username: str, user: dict = Depends(require_admin)):
     return {"deleted": username}
 
 
+_idle_stop = threading.Event()
+IDLE_CHECK_S = 5.0
+
+
+def _idle_monitor():
+    """Stop live cameras nobody has watched for IDLE_STOP_S (on-demand mode)."""
+    while not _idle_stop.wait(IDLE_CHECK_S):
+        if IDLE_STOP_S <= 0:
+            continue
+        now = time.monotonic()
+        with _cameras_lock:
+            for camera_id, worker in list(_cameras.items()):
+                if now - worker.last_viewed > IDLE_STOP_S:
+                    print(f"[{camera_id}] no viewer for {IDLE_STOP_S:.0f}s -> stopped (saves watch time)")
+                    _stop_worker(camera_id)
+
+
+def _snapshot_targets():
+    """Enabled cameras with a source that aren't currently streaming."""
+    return [(c["id"], _runnable_source(c)) for c in camera_store.list_cameras()
+            if _runnable_source(c) is not None and c["id"] not in _cameras]
+
+
+_snapshots = (SnapshotService(_snapshot_targets, interval_s=SNAPSHOT_INTERVAL_S)
+              if MAX_LIVE and SNAPSHOT_INTERVAL_S > 0 else None)
+
+
+@app.post("/api/live/{camera_id}")
+def load_live(camera_id: str, user: dict = Depends(require_operator)):
+    """Switch a camera to live streaming with full AI. In on-demand mode the
+    oldest live camera is unloaded (back to snapshots) to stay within
+    IBVAP_MAX_LIVE."""
+    cam = camera_store.get_camera(camera_id)
+    if cam is None:
+        return _error(f"No camera '{camera_id}'.", status_code=404)
+    if not auth_store.can_access_department(user, cam.get("department")):
+        return _error("Not authorized for this camera's department.", status_code=403)
+    if _runnable_source(cam) is None:
+        return _error("Camera is disabled or has no source.", status_code=400)
+    with _cameras_lock:
+        worker = _cameras.get(camera_id)
+        if worker is None or not worker.is_alive():
+            if MAX_LIVE:
+                for other in [c for c in _cameras if c != camera_id][:max(0, len(_cameras) - MAX_LIVE + 1)]:
+                    _stop_worker(other)
+            _start_worker(cam, explicit=True)
+    audit_store.log(user["username"], user["role"], "live_load", target=camera_id)
+    return _serialize_camera(cam)
+
+
+@app.get("/api/snapshot/{camera_id}")
+def get_snapshot(camera_id: str, user: dict = Depends(current_user)):
+    """Latest still for a camera (the live frame if it's streaming). Header
+    X-Snapshot-Age gives its age in seconds."""
+    cam = camera_store.get_camera(camera_id)
+    if cam is None or not auth_store.can_access_department(user, cam.get("department")):
+        return _error(f"No camera '{camera_id}'.", status_code=404)
+    worker = _cameras.get(camera_id)
+    if worker is not None and worker.latest_jpeg is not None:
+        jpeg, age = worker.latest_jpeg, 0.0
+    else:
+        snap = _snapshots.get(camera_id) if _snapshots else None
+        if snap is None:
+            return _error("No snapshot yet.", status_code=404)
+        jpeg, age = snap[0], time.time() - snap[1]
+    return Response(content=jpeg, media_type="image/jpeg",
+                    headers={"Cache-Control": "no-store", "X-Snapshot-Age": f"{age:.1f}"})
+
+
 class GatewaySyncIn(BaseModel):
     apply_active: bool = False  # re-apply IBVAP_GATEWAY_ACTIVE to existing rows
 
@@ -733,10 +978,16 @@ def _startup():
     if SEED_DEMO_USERS:
         auth_store.seed_users()
     if gateway.catalog_configured():
+        if (os.environ.get("IBVAP_GATEWAY_TRANSPORT", "rtsp").lower() == "hls"
+                and not os.environ.get("IBVAP_HLS_COOKIE", "").strip()):
+            print("[gateway] WARNING: IBVAP_GATEWAY_TRANSPORT=hls but IBVAP_HLS_COOKIE is empty — "
+                  "the portal will redirect every feed to its login page. Paste your portal "
+                  "session cookie into backend/.env.")
         # The live gateway catalogue is the contract: the registry mirrors it
         # (no demo webcam/clip seeds on a fresh DB).
         try:
-            result = gateway.sync_from_gateway()
+            # apply_active: IBVAP_GATEWAY_ACTIVE in .env decides what's enabled at boot.
+            result = gateway.sync_from_gateway(apply_active=True)
             print(f"[gateway] catalogue synced: {result['total']} cameras, "
                   f"processing {result['active']}")
         except Exception as exc:
@@ -750,6 +1001,11 @@ def _startup():
                 _start_worker(cam)
             except Exception as exc:
                 print(f"[{cam['id']}] failed to start on boot: {exc}")
+    if _snapshots:
+        _snapshots.start()
+    if MAX_LIVE:
+        _idle_stop.clear()
+        threading.Thread(target=_idle_monitor, name="idle-stop", daemon=True).start()
 
 
 GATEWAY_RESYNC_INTERVAL_S = float(os.environ.get("IBVAP_GATEWAY_RESYNC_INTERVAL_S", "300"))
@@ -793,6 +1049,9 @@ def _start_gateway_resync_thread():
 @app.on_event("shutdown")
 def _shutdown():
     _gateway_stop.set()
+    _idle_stop.set()
+    if _snapshots:
+        _snapshots.stop()
     with _cameras_lock:
         for camera in list(_cameras.values()):
             camera.stop()
@@ -850,10 +1109,15 @@ def _serialize_camera(cam: dict) -> dict:
         connectivity = "no-source"
     elif streaming:
         connectivity = "online"
+    elif MAX_LIVE:
+        connectivity = "standby"  # on-demand mode: snapshots until loaded
     else:
         connectivity = "offline"
     health = worker.health() if worker else None
-    return {**cam, "streaming": streaming, "connectivity": connectivity, "health": health}
+    snap = _snapshots.get(cam["id"]) if _snapshots else None
+    return {**cam, "streaming": streaming, "connectivity": connectivity, "health": health,
+            "snapshot_age_s": round(time.time() - snap[1], 1) if snap else None,
+            "ai_enabled": AI_ENABLED}
 
 
 def _to_float(v):
@@ -917,7 +1181,9 @@ def _demo_hooks_available():
 
 @app.get("/api/cameras")
 def list_cameras(user: dict = Depends(current_user)):
-    return {"cameras": [_serialize_camera(c) for c in _visible_cameras(user)]}
+    rank = {cam_id: i for i, cam_id in enumerate(PRIORITY_CAMERAS)}
+    cams = sorted(_visible_cameras(user), key=lambda c: (rank.get(c["id"], len(rank)), c["id"]))
+    return {"cameras": [_serialize_camera(c) for c in cams]}
 
 
 @app.get("/api/cameras/export.csv")
@@ -1184,7 +1450,8 @@ def inject_sighting(body: SightingIn, user: dict = Depends(require_operator)):
 @app.get("/api/route/{plate}")
 def get_route(plate: str, fuse_reid: bool = True, use_topology: bool = True,
               user: dict = Depends(current_user)):
-    result = route.reconstruct_route(plate, fuse_reid=fuse_reid, use_topology=use_topology)
+    result = road_paths.add_road_paths(
+        route.reconstruct_route(plate, fuse_reid=fuse_reid, use_topology=use_topology))
     audit_store.log(user["username"], user["role"], "search_plate", target=result.get("plate"),
                     detail=f"{result['meta'].get('stop_count', 0)} stops")
     return result
@@ -1335,21 +1602,30 @@ def _error(message: str, status_code: int = 400):
 
 
 def _mjpeg_generator(camera: CameraWorker):
+    """Push each new frame as soon as it's published (no fixed-rate polling,
+    so the browser gets the full camera frame rate without duplicates)."""
     boundary = b"--frame"
-    interval = 1.0 / STREAM_FPS
+    seen = -1
     while True:
-        with camera.frame_lock:
-            frame = camera.latest_jpeg
-        if frame is not None:
-            yield (
-                boundary
-                + b"\r\nContent-Type: image/jpeg\r\nContent-Length: "
-                + str(len(frame)).encode()
-                + b"\r\n\r\n"
-                + frame
-                + b"\r\n"
-            )
-        time.sleep(interval)
+        # Updated at least once a second while this viewer stays connected
+        # (the idle monitor stops cameras nobody is watching).
+        camera.last_viewed = time.monotonic()
+        with camera.frame_ready:
+            camera.frame_ready.wait_for(lambda: camera.frame_seq != seen, timeout=1.0)
+            frame, seen = camera.latest_jpeg, camera.frame_seq
+        if frame is None:
+            # No picture yet (buffering / gateway refusing): hand control back
+            # so a disconnected viewer is noticed instead of blocking forever.
+            yield b""
+            continue
+        yield (
+            boundary
+            + b"\r\nContent-Type: image/jpeg\r\nContent-Length: "
+            + str(len(frame)).encode()
+            + b"\r\n\r\n"
+            + frame
+            + b"\r\n"
+        )
 
 
 @app.get("/api/stream/{camera_id}")
@@ -1656,7 +1932,7 @@ from fastapi.routing import APIRoute as _APIRoute  # noqa: E402
 _TAG_BY_PREFIX = [
     ("/api/auth", "Auth"), ("/api/users", "Auth"),
     ("/api/stream", "Cameras"), ("/api/thermal", "Cameras"), ("/api/cameras", "Cameras"),
-    ("/api/gateway", "Cameras"),
+    ("/api/gateway", "Cameras"), ("/api/live", "Cameras"), ("/api/snapshot", "Cameras"),
     ("/api/zones", "Zones"),
     ("/api/watchlist", "Watchlist"),
     ("/api/route", "Route Reconstruction"),

@@ -30,11 +30,14 @@ Adapters:
 call; it dispatches on the spec to the right adapter.
 """
 
+import collections
+import io
 import os
 import random
+import re
 import threading
 import time
-from urllib.parse import quote, urlparse, urlunparse
+from urllib.parse import quote, urljoin, urlparse, urlunparse
 
 # FFmpeg capture options must be in the environment BEFORE OpenCV's FFmpeg
 # plugin first opens a stream (on Windows the plugin DLL snapshots the env at
@@ -45,12 +48,8 @@ _FFMPEG_OPTS_ENV = "OPENCV_FFMPEG_CAPTURE_OPTIONS"
 
 
 def _default_ffmpeg_options() -> str:
-    opts = ["rtsp_transport;tcp"]
-    cookie = os.environ.get("IBVAP_HLS_COOKIE", "").strip()
-    if cookie:
-        # Session cookie for an authenticated HLS gateway (FFmpeg http option).
-        opts.append(f"headers;Cookie: {cookie}\r\n")
-    return "|".join(opts)
+    # (HLS is fetched by HlsBufferedSource, which sends the portal cookie itself.)
+    return "rtsp_transport;tcp"
 
 
 os.environ.setdefault(_FFMPEG_OPTS_ENV, _default_ffmpeg_options())
@@ -269,6 +268,11 @@ class VideoSource:
             max_reconnect_attempts = 5
         self.max_reconnect_attempts = max_reconnect_attempts
         self.latest_frame_only = self.is_network if latest_frame_only is None else latest_frame_only
+        # HLS from the gateway portal is a recording served as files: FFmpeg
+        # would read it as fast as the download allows (fast-forward on a
+        # quick link), so frames are released at the rate their PTS says.
+        self.pace_realtime = is_hls_uri(uri)
+        self._pace_anchor = None  # (monotonic wall time, pts seconds)
 
         # Webcams expose no trustworthy PTS through OpenCV; everything else
         # (RTSP/HLS/files) is timed from the stream's own timestamps.
@@ -280,6 +284,9 @@ class VideoSource:
         self._stop = threading.Event()
         self._cond = threading.Condition()
         self._slot = None           # newest (frame, raw_ms, conn_gen) from the reader
+        # Optional hook called by the reader thread with EVERY decoded frame
+        # (the AI loop only sees the newest one) — used for full-rate display.
+        self.on_decoded = None
         self._reader = None
         self._reader_done = False
         self._conn_gen = 0          # increments on every successful (re)connect
@@ -317,6 +324,7 @@ class VideoSource:
             self._stats["connected"] = False
             raise ConnectionError(f"[{self.name}] could not open source: {redact_uri(self.uri)}")
         self._conn_gen += 1
+        self._pace_anchor = None
         self._stats["connected"] = True
         self._stats["codec"] = _fourcc_to_str(self.cap.get(cv2.CAP_PROP_FOURCC)) or self._stats["codec"]
 
@@ -346,6 +354,23 @@ class VideoSource:
                 self._stats["last_error"] = str(exc)
         return False
 
+    def _pace(self, raw_ms):
+        """Real-time playback for HLS: hold a frame until its PTS is due.
+        After a stall (download slower than playback) re-anchor instead of
+        fast-forwarding to catch up — the same behaviour as a browser player."""
+        if not self.pace_realtime or not raw_ms or raw_ms <= 0:
+            return
+        now, pts = time.monotonic(), raw_ms / 1000.0
+        if self._pace_anchor is None:
+            self._pace_anchor = (now, pts)
+            return
+        wall0, pts0 = self._pace_anchor
+        ahead = (pts - pts0) - (now - wall0)
+        if ahead > 1.0 or ahead < -0.5:
+            self._pace_anchor = (now, pts)  # PTS jump or stall: restart the clock here
+        elif ahead > 0:
+            self._wait(ahead)
+
     # -- reading ----------------------------------------------------------
     def _read_one(self):
         """Read one frame, reconnecting as needed. Returns (frame, raw_ms, gen)
@@ -360,6 +385,7 @@ class VideoSource:
                 self._backoff = None  # healthy again: next outage starts at ~2s
                 raw_ms = self.cap.get(cv2.CAP_PROP_POS_MSEC)
                 self._note_decoded(frame, raw_ms)
+                self._pace(raw_ms)
                 return frame, raw_ms, self._conn_gen
             if not self.is_stream:
                 return None  # end of file — normal termination for recorded footage
@@ -390,6 +416,11 @@ class VideoSource:
                 item = self._read_one()
                 if item is None:
                     break
+                if self.on_decoded is not None:
+                    try:
+                        self.on_decoded(item[0])
+                    except Exception as exc:  # display must never kill ingestion
+                        print(f"[{self.name}] display hook failed: {exc}")
                 with self._cond:
                     if self._slot is not None:
                         self._stats["frames_dropped"] += 1
@@ -470,6 +501,319 @@ class VideoSource:
             self._reader.join(timeout=READ_TIMEOUT_MS / 1000.0 + 2)
         if self.cap is not None:
             self.cap.release()
+
+
+class _ChunkStream:
+    """One HLS chunk that the decoder can read WHILE it is still downloading:
+    the downloader feeds bytes in as they arrive, read() hands them out and
+    blocks only until the next bytes come in."""
+
+    def __init__(self, seq, duration):
+        self.seq, self.duration = seq, duration
+        self._buf = bytearray()
+        self._cond = threading.Condition()
+        self._done = False
+
+    def feed(self, data):
+        if data:
+            with self._cond:
+                self._buf += data
+                self._cond.notify_all()
+
+    def finish(self):
+        with self._cond:
+            self._done = True
+            self._cond.notify_all()
+
+    def read(self, size=-1):
+        with self._cond:
+            while not self._buf and not self._done:
+                self._cond.wait(timeout=0.5)
+            n = len(self._buf) if size is None or size < 0 else min(size, len(self._buf))
+            out = bytes(self._buf[:n])
+            del self._buf[:n]
+            return out
+
+
+class HlsBufferedSource(VideoSource):
+    """HLS reader for the gateway portal feeds that adapts to the bandwidth.
+
+    Chunks are decoded WHILE they download (progressive), so frames reach
+    the screen as soon as their bytes arrive — a slow 1080p chunk no longer
+    means waiting ~45 s for the whole 6 s file. A downloader thread fetches
+    (and AES-128-decrypts, block by block) chunks ahead of playback, up to
+    IBVAP_HLS_MAX_BUFFER_S of video. Playback speed follows the bandwidth:
+    real speed when the link keeps up, and every frame shown as soon as it
+    arrives when it doesn't (never frozen waiting for a buffer to fill).
+
+    The portal session cookie (IBVAP_HLS_COOKIE) is sent only to hosts in
+    IBVAP_HLS_COOKIE_HOSTS. Everything downstream — reconnect backoff, PTS
+    timing, real-time pacing, the full-rate display hook — is VideoSource's.
+    """
+
+    _UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36"
+
+    def __init__(self, uri, name="camera", start_buffer_s=None, max_buffer_s=None, **kwargs):
+        import requests
+
+        self._start_buffer_s = float(start_buffer_s if start_buffer_s is not None
+                                     else os.environ.get("IBVAP_HLS_START_BUFFER_S", "0"))
+        self._max_buffer_s = float(max_buffer_s if max_buffer_s is not None
+                                   else os.environ.get("IBVAP_HLS_MAX_BUFFER_S", "60"))
+        self._http = requests.Session()
+        self._seg_cond = threading.Condition()
+        self._segments = collections.deque()  # _ChunkStream objects, in play order
+        self._buffered_s = 0.0
+        self._playing = False                 # False while (re)buffering
+        self._playlist = None                 # parsed media playlist
+        self._next_seq = None                 # next media-sequence number to download
+        self._downloader = None
+        self._current = None                  # chunk being decoded
+        self._container = None
+        self._frame_iter = None
+        self._hls = {"segments_downloaded": 0, "stalls": 0, "download_mbit_s": None}
+        super().__init__(uri, name=name, **kwargs)
+
+    # -- HTTP --------------------------------------------------------------
+    def _headers(self, url):
+        headers = {"User-Agent": self._UA}
+        cookie = os.environ.get("IBVAP_HLS_COOKIE", "").strip()
+        hosts = {h.strip().lower() for h in
+                 os.environ.get("IBVAP_HLS_COOKIE_HOSTS", "cctv.corp8.cloud").split(",") if h.strip()}
+        if cookie and (urlparse(url).hostname or "").lower() in hosts:
+            headers["Cookie"] = cookie
+        return headers
+
+    def _get(self, url, timeout=30, stream=False):
+        resp = self._http.get(url, headers=self._headers(url), timeout=timeout,
+                              allow_redirects=False, stream=stream)
+        if resp.status_code != 200:
+            detail = resp.text[:100] if resp.headers.get("content-type", "").startswith("text") else ""
+            if resp.status_code in (301, 302, 303, 307) and "/auth/login" in resp.headers.get("location", ""):
+                detail = "redirected to login — IBVAP_HLS_COOKIE missing or expired"
+            resp.close()
+            raise ConnectionError(f"[{self.name}] HTTP {resp.status_code} for "
+                                  f"{urlparse(url).path}: {detail}".rstrip(": "))
+        return resp
+
+    def _load_playlist(self):
+        """Fetch + parse the media playlist (following a master playlist to
+        its first variant) and the AES-128 key if the chunks are encrypted."""
+        url = self.uri
+        text = self._get(url, timeout=15).text
+        if "#EXT-X-STREAM-INF" in text:
+            variant = next(l.strip() for l in text.splitlines() if l.strip() and not l.startswith("#"))
+            url = urljoin(url, variant)
+            text = self._get(url, timeout=15).text
+        if not text.startswith("#EXTM3U"):
+            raise ConnectionError(f"[{self.name}] not an HLS playlist")
+        seq, duration, key, segments = 0, None, None, []
+        for line in text.splitlines():
+            line = line.strip()
+            if line.startswith("#EXT-X-MEDIA-SEQUENCE:"):
+                seq = int(line.split(":", 1)[1])
+            elif line.startswith("#EXTINF:"):
+                duration = float(line[8:].split(",")[0])
+            elif line.startswith("#EXT-X-KEY:"):
+                attrs = dict(re.findall(r'([A-Z0-9-]+)=("[^"]*"|[^,]*)', line[11:]))
+                attrs = {k: v.strip('"') for k, v in attrs.items()}
+                key = None if attrs.get("METHOD", "NONE") == "NONE" else attrs
+            elif line and not line.startswith("#"):
+                segments.append({"seq": seq, "url": urljoin(url, line), "duration": duration or 6.0, "key": key})
+                seq, duration = seq + 1, None
+        keys = {}
+        for seg in segments:
+            k = seg["key"]
+            if k and k.get("URI") not in keys:
+                if k.get("METHOD") != "AES-128":
+                    raise ConnectionError(f"[{self.name}] unsupported HLS encryption {k.get('METHOD')}")
+                keys[k["URI"]] = self._get(urljoin(url, k["URI"]), timeout=15).content
+        self._playlist = {"segments": segments, "keys": keys, "base": url,
+                          "ended": "#EXT-X-ENDLIST" in text or "PLAYLIST-TYPE:VOD" in text}
+
+    def _decryptor(self, seg):
+        k = seg["key"]
+        if not k:
+            return None
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+        iv = bytes.fromhex(k["IV"][2:]) if k.get("IV", "").lower().startswith("0x") else seg["seq"].to_bytes(16, "big")
+        return Cipher(algorithms.AES(self._playlist["keys"][k["URI"]]), modes.CBC(iv)).decryptor()
+
+    # -- downloader thread -------------------------------------------------------
+    def _next_segment(self):
+        """The next chunk to fetch; loops a finished (VOD) playlist, and
+        re-reads a live playlist for new chunks."""
+        segs = self._playlist["segments"]
+        if self._next_seq is None:
+            self._next_seq = segs[0]["seq"] if segs else 0
+        for seg in segs:
+            if seg["seq"] >= self._next_seq:
+                return seg
+        if self._playlist["ended"]:
+            self._next_seq = segs[0]["seq"]  # feeds loop: start again
+            return segs[0]
+        self._load_playlist()  # live: fetch newly published chunks
+        return next((s for s in self._playlist["segments"] if s["seq"] >= self._next_seq), None)
+
+    def _download(self, seg, resp, chunk):
+        """Stream one chunk's bytes into `chunk` as they arrive, decrypting
+        block by block (the last block is held back for padding removal)."""
+        dec, held, total, t0 = self._decryptor(seg), b"", 0, time.monotonic()
+        try:
+            for block in resp.iter_content(chunk_size=16384):
+                if self._stop.is_set():
+                    return
+                total += len(block)
+                if dec is None:
+                    chunk.feed(block)
+                    continue
+                buf = held + dec.update(block)
+                chunk.feed(buf[:-16])
+                held = buf[-16:]
+            if dec is not None:
+                tail = held + dec.finalize()
+                chunk.feed(tail[:-tail[-1]] if tail and 0 < tail[-1] <= 16 else tail)
+        finally:
+            chunk.finish()
+            resp.close()
+        dt = time.monotonic() - t0
+        self._hls["segments_downloaded"] += 1
+        self._hls["download_mbit_s"] = round(total * 8 / max(dt, 1e-3) / 1e6, 2)
+
+    def _download_loop(self):
+        backoff = None
+        while not self._stop.is_set():
+            with self._seg_cond:
+                while self._buffered_s >= self._max_buffer_s and not self._stop.is_set():
+                    self._seg_cond.wait(timeout=0.5)
+            if self._stop.is_set():
+                return
+            try:
+                seg = self._next_segment()
+                if seg is None:
+                    self._wait(2.0)
+                    continue
+                resp = self._get(seg["url"], timeout=(10, 30), stream=True)
+                backoff = None
+                chunk = _ChunkStream(seg["seq"], seg["duration"])
+                with self._seg_cond:  # playable as soon as its first bytes arrive
+                    self._segments.append(chunk)
+                    self._buffered_s += seg["duration"]
+                    self._seg_cond.notify_all()
+                self._next_seq = seg["seq"] + 1
+                self._download(seg, resp, chunk)
+            except Exception as exc:
+                self._stats["last_error"] = str(exc)
+                self._stats["read_failures"] += 1
+                if backoff is None:
+                    backoff = backoff_delays(self.reconnect_delay_s, self.max_reconnect_delay_s, self.backoff_jitter)
+                delay = next(backoff)
+                print(f"[{self.name}] HLS download failed ({exc}); retrying in {delay:.1f}s")
+                if self._wait(delay):
+                    return
+                try:
+                    self._load_playlist()  # e.g. a refreshed cookie, or a changed playlist
+                except Exception:
+                    pass
+
+    # -- VideoSource hooks ---------------------------------------------------------
+    def _open(self):
+        try:
+            self._load_playlist()
+        except ConnectionError:
+            raise
+        except Exception as exc:  # timeouts, DNS, TLS … -> the normal backoff path
+            raise ConnectionError(f"[{self.name}] {exc}") from exc
+        self._conn_gen += 1
+        self._pace_anchor = None
+        self._stats["connected"] = True
+        if self._downloader is None:
+            self._downloader = threading.Thread(target=self._download_loop,
+                                                name=f"hls-{self.name}", daemon=True)
+            self._downloader.start()
+
+    def _close_container(self):
+        if self._container is not None:
+            try:
+                self._container.close()
+            except Exception:
+                pass
+        self._container, self._frame_iter, self._current = None, None, None
+
+    def _read_one(self):
+        import av
+
+        while not self._stop.is_set():
+            if self._playlist is None:  # initial connect failed: retry with backoff
+                if not self._reconnect():
+                    return None
+                continue
+            if self._frame_iter is not None:
+                try:
+                    frame = next(self._frame_iter)
+                except StopIteration:
+                    self._close_container()
+                    continue
+                except av.FFmpegError as exc:
+                    print(f"[{self.name}] skipping undecodable chunk: {exc}")
+                    self._close_container()
+                    continue
+                img = frame.to_ndarray(format="bgr24")
+                raw_ms = frame.time * 1000.0 if frame.time is not None else None
+                self._backoff = None
+                self._note_decoded(img, raw_ms)
+                self._pace(raw_ms)
+                return img, raw_ms, self._conn_gen
+
+            with self._seg_cond:
+                # Optional start buffer (IBVAP_HLS_START_BUFFER_S, default 0 =
+                # start with the first bytes).
+                need = self._start_buffer_s if not self._playing else 0.0
+                while (not self._segments or self._buffered_s < need) and not self._stop.is_set():
+                    if self._playing:
+                        self._playing = False
+                        self._hls["stalls"] += 1
+                        need = self._start_buffer_s
+                    self._seg_cond.wait(timeout=0.5)
+                if self._stop.is_set():
+                    return None
+                self._playing = True
+                self._current = self._segments.popleft()
+                self._buffered_s -= self._current.duration
+                self._seg_cond.notify_all()
+            try:
+                # Tiny probe so decoding starts on the first bytes, not after
+                # FFmpeg has read megabytes of a slow download.
+                self._container = av.open(self._current, format="mpegts",
+                                          options={"probesize": "32768", "analyzeduration": "0"})
+                stream = self._container.streams.video[0]
+                stream.thread_type = "AUTO"
+                self._stats["codec"] = stream.codec_context.name
+                self._frame_iter = self._container.decode(stream)
+            except (av.FFmpegError, IndexError) as exc:
+                print(f"[{self.name}] skipping unreadable chunk: {exc}")
+                self._close_container()
+        return None
+
+    def stats(self) -> dict:
+        st = super().stats()
+        st.update(self._hls)
+        st["buffered_s"] = round(self._buffered_s, 1)
+        st["buffering"] = not self._playing
+        return st
+
+    def release(self):
+        self.stop()
+        with self._seg_cond:
+            for chunk in list(self._segments) + ([self._current] if self._current else []):
+                chunk.finish()  # unblock a decoder waiting for bytes
+            self._seg_cond.notify_all()
+        super().release()
+        if self._downloader is not None and self._downloader is not threading.current_thread():
+            self._downloader.join(timeout=5)
+        self._close_container()
+        self._http.close()
 
 
 class MjpegHttpSource:
@@ -740,8 +1084,8 @@ def open_source(spec, name="camera", **kwargs):
         return VideoSource(rtsp_uri, name=name, **kwargs)
 
     if is_hls_uri(spec):
-        # HLS (e.g. https://cctv.corp8.cloud/<id>/index.m3u8) decodes via FFmpeg.
-        return VideoSource(spec, name=name, **kwargs)
+        # HLS (e.g. https://cctv.corp8.cloud/<id>/index.m3u8): buffered download-ahead.
+        return HlsBufferedSource(spec, name=name, **kwargs)
 
     if scheme in ("http", "https"):
         return MjpegHttpSource(spec, name=name, **kwargs)

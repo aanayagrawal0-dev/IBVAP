@@ -35,3 +35,5 @@ frontend/screenshots/
 
 # Misc
 *.zip
+# Cached road geometry for the route map (regenerated automatically)
+backend/road_paths_cache.json

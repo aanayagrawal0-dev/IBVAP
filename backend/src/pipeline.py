@@ -6,6 +6,8 @@ alert engine, ANPR, and dashboard layers get bolted on.
 """
 
 import os
+import queue
+import threading
 import time
 import cv2
 import numpy as np
@@ -67,6 +69,20 @@ class Pipeline:
 
         self.box_annotator = sv.BoxAnnotator(thickness=2)
         self.label_annotator = sv.LabelAnnotator(text_thickness=1, text_scale=0.5)
+        # Separate annotators for the full-rate display thread (render_display).
+        self._display_box = sv.BoxAnnotator(thickness=2)
+        self._display_label = sv.LabelAnnotator(text_thickness=1, text_scale=0.5)
+        # Latest AI result (tracked, labels, kpts_xy, kpts_conf), drawn onto
+        # every displayed frame between AI passes.
+        self._overlay = None
+
+        # Plate OCR runs on its own thread (PaddleOCR takes ~0.3 s per read),
+        # so a busy junction never stalls detection/tracking; reads land in
+        # _plate_cache and are picked up on the next frame.
+        self._ocr_async = self.anpr_engine.enabled
+        self._ocr_jobs: "queue.Queue" = queue.Queue(maxsize=8)
+        if self._ocr_async:
+            threading.Thread(target=self._ocr_loop, name=f"ocr-{source_name}", daemon=True).start()
 
         self.events = []  # collected ZoneEvent log
 
@@ -139,11 +155,42 @@ class Pipeline:
         if last is not None and (idx - last) < self.anpr_interval:
             return self._plate_cache.get(tid)
         self._plate_read_frame[tid] = idx
+        if getattr(self, "_ocr_async", False):
+            crop = frame[max(0, int(y1)):int(y2), max(0, int(x1)):int(x2)].copy()
+            try:
+                self._ocr_jobs.put_nowait((tid, crop))
+            except queue.Full:
+                self._plate_read_frame.pop(tid, None)  # retry on a later frame
+            return self._plate_cache.get(tid)
         plate = self.anpr_engine.extract_plate(frame, x1, y1, x2, y2)
         if plate:
             self._plate_cache[tid] = plate
             return plate
         return self._plate_cache.get(tid)
+
+    def _ocr_loop(self):
+        while True:
+            tid, crop = self._ocr_jobs.get()
+            h, w = crop.shape[:2]
+            plate = self.anpr_engine.extract_plate(crop, 0, 0, w, h) if h and w else None
+            if plate:
+                self._plate_cache[tid] = plate
+
+    def _annotate(self, frame, overlay, box, label):
+        tracked, labels, kpts_xy_all, kpts_conf_all = overlay
+        annotated = frame.copy()
+        annotated = box.annotate(annotated, tracked)
+        annotated = label.annotate(annotated, tracked, labels=labels)
+        annotated = self._draw_skeletons(annotated, kpts_xy_all, kpts_conf_all)
+        return self._draw_zones(annotated)
+
+    def render_display(self, frame):
+        """Draw the latest AI overlay onto a raw frame — lets the display run
+        at the camera's full frame rate while AI runs at its own pace."""
+        overlay = self._overlay
+        if overlay is None:
+            return self._draw_zones(frame.copy())
+        return self._annotate(frame, overlay, self._display_box, self._display_label)
 
     def _frame_timing(self, frame):
         """PTS-derived timing for the frame just yielded by the source, plus
@@ -295,8 +342,12 @@ class Pipeline:
         }
 
     def stream(self, on_frame, on_event=None, loop=True, target_fps=None, stop_flag=None,
-               night_vision_flag=None, on_watchlist=None, on_analytic=None):
+               night_vision_flag=None, on_watchlist=None, on_analytic=None, analyze_flag=None):
+        # target_fps caps the AI (analysed frames only). analyze_flag(), when
+        # given, may skip the AI for a frame: it is then drawn with the latest
+        # overlay, so the video keeps its full rate when the AI can't.
         frame_interval = 1.0 / target_fps if target_fps else None
+        self.last_frame_analyzed = True
 
         while True:
             for idx, frame in self.source.frames():
@@ -304,6 +355,11 @@ class Pipeline:
                     return
                 t_start = time.time()
                 vidx = self._frame_timing(frame)
+                if analyze_flag is not None and not analyze_flag():
+                    self.last_frame_analyzed = False
+                    on_frame(self.render_display(frame))
+                    continue
+                self.last_frame_analyzed = True
 
                 is_night_vision = night_vision_flag() if callable(night_vision_flag) else self.night_vision
                 if is_night_vision:
@@ -380,11 +436,8 @@ class Pipeline:
                         self.events.append(evt)
                         fired_this_frame.append((evt, class_name))
 
-                annotated = frame.copy()
-                annotated = self.box_annotator.annotate(annotated, tracked)
-                annotated = self.label_annotator.annotate(annotated, tracked, labels=labels)
-                annotated = self._draw_skeletons(annotated, kpts_xy_all, kpts_conf_all)
-                annotated = self._draw_zones(annotated)
+                self._overlay = (tracked, labels, kpts_xy_all, kpts_conf_all)
+                annotated = self._annotate(frame, self._overlay, self.box_annotator, self.label_annotator)
                 on_frame(annotated)
 
                 if on_event:

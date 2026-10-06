@@ -6,13 +6,25 @@
 export const LEAFLET_CSS = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.css";
 export const LEAFLET_JS = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.js";
 
-// Dark basemap that matches the obsidian theme (no API key required).
-export const DARK_TILES = "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png";
+// OpenStreetMap's standard tiles (no API key), darkened with a CSS filter to
+// match the obsidian theme. CARTO's dark tiles now require an API key and
+// render "API KEY REQUIRED" instead of the map.
+export const DARK_TILES = "https://tile.openstreetmap.org/{z}/{x}/{y}.png";
 export const TILE_ATTR =
-  '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>';
+  '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors';
+
+const DARK_TILE_CSS =
+  ".leaflet-tile-pane{filter:invert(1) hue-rotate(180deg) brightness(0.9) contrast(0.9) saturate(0.6)}";
 
 export function loadLeaflet(): Promise<any> {
   return new Promise((resolve, reject) => {
+    if (!document.getElementById("dark-tiles-css")) {
+      const style = document.createElement("style");
+      style.id = "dark-tiles-css";
+      style.textContent = DARK_TILE_CSS; // darken the map only, not markers or lines
+      document.head.appendChild(style);
+    }
+
     const w = window as any;
     if (w.L) return resolve(w.L);
 

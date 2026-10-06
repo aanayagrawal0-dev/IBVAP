@@ -199,6 +199,7 @@ def _collapse_stops(chosen, cams) -> list[dict]:
             "plate_source": s["_source"],
             "reid_similarity": s["_sim"],
             "sighting_id": s["id"],
+            "class_name": s.get("class_name"),
         })
     for i, st in enumerate(stops):
         st["seq"] = i + 1

@@ -13,3 +13,5 @@ torch>=2.0.0
 torchvision>=0.15.0
 paddlepaddle>=3.0.0
 paddleocr>=3.0.0
+av>=12.0.0  # buffered HLS reader (decodes portal chunks from memory)
+cryptography>=41.0.0  # AES-128 HLS chunk decryption

@@ -215,7 +215,28 @@ def _active_ids(entries: list[dict]) -> set[str]:
     return {e["id"] for e in [x for x in entries if x["live"]][:cap]}
 
 
-def _storage_details(entry: dict) -> str:
+_LOCATIONS_PATH = os.path.join(os.path.dirname(__file__), "..", "camera_locations.json")
+
+
+def _known_location(entry: dict) -> dict | None:
+    """Map position for a camera the catalogue gives no coordinates for, from
+    camera_locations.json (IBVAP_CAMERA_LOCATIONS). Only used when the
+    table's 'match' text appears in the camera's name, so a renumbered
+    catalogue can't put a camera in the wrong town."""
+    path = _env("IBVAP_CAMERA_LOCATIONS") or _LOCATIONS_PATH
+    try:
+        with open(path, encoding="utf-8") as fh:
+            table = json.load(fh).get("cameras", {})
+    except (OSError, ValueError):
+        return None
+    loc = table.get(entry["id"])
+    name = f"{entry.get('name', '')} {entry.get('location') or ''}".lower()
+    if not loc or loc.get("match", "").lower() not in name:
+        return None
+    return loc
+
+
+def _storage_details(entry: dict, loc: dict | None = None) -> str:
     bits = ["Live gateway feed (no local copy)"]
     if entry.get("codec"):
         bits.append(str(entry["codec"]).upper())
@@ -223,6 +244,8 @@ def _storage_details(entry: dict) -> str:
         bits.append(f"{entry['width']}x{entry['height']}")
     if entry.get("declared_fps"):
         bits.append(f"{entry['declared_fps']:g} fps declared")
+    if loc:
+        bits.append(f"Map position: {loc['place']} ({loc['precision']}-level, approximate)")
     return " · ".join(bits)
 
 
@@ -243,6 +266,14 @@ def sync_registry(entries: list[dict], apply_active: bool = False) -> dict:
     for entry in entries:
         cam_id = entry["id"]
         catalog_ids.add(cam_id)
+        existing = camera_store.get_camera(cam_id)
+        # The catalogue has no coordinates: place known cameras on the map,
+        # but never overwrite a position an operator has set in the Registry.
+        loc = _known_location(entry) if entry.get("lat") is None else None
+        moved = existing and existing.get("lat") is not None and loc \
+            and (existing["lat"], existing["lon"]) != (loc["lat"], loc["lon"])
+        if moved:
+            loc = None  # an operator moved this camera: keep their position
         fields = {
             "name": (f"{entry['name']} — {entry['location']}"
                      if entry.get("location") and entry["location"] != entry["name"]
@@ -251,11 +282,10 @@ def sync_registry(entries: list[dict], apply_active: bool = False) -> dict:
             "ownership": GATEWAY_OWNERSHIP,
             "source_spec": source_spec_for(entry),
             "status": "live" if entry["live"] else "down",
-            "storage_details": _storage_details(entry),
-            "lat": entry.get("lat"),
-            "lon": entry.get("lon"),
+            "storage_details": _storage_details(entry, loc),
+            "lat": entry.get("lat") if entry.get("lat") is not None else (loc or {}).get("lat"),
+            "lon": entry.get("lon") if entry.get("lon") is not None else (loc or {}).get("lon"),
         }
-        existing = camera_store.get_camera(cam_id)
         if existing is None:
             camera_store.add_camera(cam_id, {**fields, "enabled": cam_id in active and entry["live"]})
             added.append(cam_id)

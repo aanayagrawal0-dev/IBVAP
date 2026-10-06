@@ -13,7 +13,7 @@ import { CONNECTIVITY_LABEL, HEALTH_LABEL } from "@/lib/cameras";
 
 const SEVERITY_COLOR: Record<string, string> = { critical: "#FF3B30", warning: "#F5A623", info: "#8B8B93" };
 const CONN_COLOR: Record<string, string> = {
-  online: "#22C55E", offline: "#F5A623", disabled: "#71717A", "no-source": "#3B82F6",
+  online: "#22C55E", offline: "#F5A623", disabled: "#71717A", "no-source": "#3B82F6", standby: "#06B6D4",
 };
 const RANGES: { label: string; hours?: number }[] = [
   { label: "24h", hours: 24 },

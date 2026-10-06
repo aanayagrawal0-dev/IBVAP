@@ -40,7 +40,7 @@ MODELS_DIR = Path(__file__).parent.parent / "models"
 
 
 class Detector:
-    def __init__(self, base_weights="yolo11n.pt", pose_weights="yolo11n-pose.pt",
+    def __init__(self, base_weights=None, pose_weights="yolo11n-pose.pt",
                  conf_threshold=0.35, device=None, weights=None):
         """
         Dual-model initializer.
@@ -51,6 +51,9 @@ class Detector:
         """
         if weights is not None and "pose" in weights:
             pose_weights = weights
+        # Detector size is a setting: on a GPU, larger models (yolo11s/m) are
+        # more accurate for small/distant/night targets at similar latency.
+        base_weights = base_weights or os.environ.get("IBVAP_DETECTOR_WEIGHTS", "yolo11n.pt")
 
         base_path = self._resolve_model_path(base_weights)
         pose_path = self._resolve_model_path(pose_weights)
@@ -115,39 +118,42 @@ class Detector:
         keypoints_xy = np.zeros((num_det, 17, 2), dtype=np.float32)
         keypoints_conf = np.zeros((num_det, 17), dtype=np.float32)
 
+        # Person crops -> ONE batched pose call (not one call per person).
+        crops, owners = [], []
         for i in range(num_det):
-            cls_id = int(detections.class_id[i])
-            if cls_id == 0:  # Person: run pose estimation on crop
-                x1, y1, x2, y2 = detections.xyxy[i].astype(int)
-                x1, y1 = max(0, x1), max(0, y1)
-                x2, y2 = min(frame_w, x2), min(frame_h, y2)
+            if int(detections.class_id[i]) != 0:
+                continue
+            x1, y1, x2, y2 = detections.xyxy[i].astype(int)
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(frame_w, x2), min(frame_h, y2)
+            if (x2 - x1) > 5 and (y2 - y1) > 5:
+                crops.append(frame[y1:y2, x1:x2])
+                owners.append((i, x1, y1))
 
-                if (x2 - x1) > 5 and (y2 - y1) > 5:
-                    crop = frame[y1:y2, x1:x2]
-                    try:
-                        pose_results = self.pose_estimator(
-                            crop,
-                            conf=max(0.20, self.conf_threshold - 0.10),
-                            device=self.device,
-                            verbose=False,
-                        )[0]
-
-                        if pose_results.keypoints is not None and pose_results.keypoints.data is not None:
-                            kpts_data = pose_results.keypoints.data.cpu().numpy()
-                            if len(kpts_data) > 0:
-                                # Use top pose detection within crop
-                                crop_xy = kpts_data[0, :, :2]
-                                crop_conf = kpts_data[0, :, 2] if kpts_data.shape[-1] >= 3 else np.ones(17)
-
-                                # Map local crop coordinates to global frame
-                                global_xy = crop_xy.copy()
-                                global_xy[:, 0] += x1
-                                global_xy[:, 1] += y1
-
-                                keypoints_xy[i] = global_xy
-                                keypoints_conf[i] = crop_conf
-                    except Exception as exc:
-                        logger.warning("Crop pose estimation failed for detection %d: %s", i, exc)
+        if crops:
+            try:
+                pose_batch = self.pose_estimator(
+                    crops,
+                    conf=max(0.20, self.conf_threshold - 0.10),
+                    device=self.device,
+                    verbose=False,
+                )
+                for (i, x1, y1), pose_results in zip(owners, pose_batch):
+                    if pose_results.keypoints is None or pose_results.keypoints.data is None:
+                        continue
+                    kpts_data = pose_results.keypoints.data.cpu().numpy()
+                    if len(kpts_data) == 0:
+                        continue
+                    # Use top pose detection within crop, mapped to global frame coords.
+                    crop_xy = kpts_data[0, :, :2]
+                    crop_conf = kpts_data[0, :, 2] if kpts_data.shape[-1] >= 3 else np.ones(17)
+                    global_xy = crop_xy.copy()
+                    global_xy[:, 0] += x1
+                    global_xy[:, 1] += y1
+                    keypoints_xy[i] = global_xy
+                    keypoints_conf[i] = crop_conf
+            except Exception as exc:
+                logger.warning("Batched pose estimation failed: %s", exc)
 
         if detections.data is None:
             detections.data = {}

@@ -35,6 +35,7 @@ const STATUS_COLOR: Record<RegistryCamera["connectivity"], string> = {
   offline: "#F5A623",
   disabled: "#71717A",
   "no-source": "#3B82F6",
+  standby: "#06B6D4",
 };
 
 type FormState = {
@@ -156,6 +157,15 @@ export default function RegistryPage() {
            Type: ${cam.camera_type} &middot; ${CONNECTIVITY_LABEL[cam.connectivity]}<br/>
            Owner: ${escapeHtml(cam.ownership || "—")}
          </div>`
+      );
+      marker.bindTooltip(
+        `<div style="font-family:system-ui;font-size:12px;line-height:1.4">
+           <strong>${cam.id}</strong> — ${escapeHtml(cam.name)}<br/>
+           ${CONNECTIVITY_LABEL[cam.connectivity]}${
+             cam.storage_details?.includes("approximate") ? " · approx. position" : ""
+           }
+         </div>`,
+        { direction: "top", offset: [0, -8] }
       );
       marker.on("click", () => beginEdit(cam));
       marker.addTo(byDept.get(dept));
